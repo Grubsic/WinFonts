@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)
+WINFONTS_PROG=$0 exec python3 "$SCRIPT_DIR/winfonts_engine.py" "$@"
