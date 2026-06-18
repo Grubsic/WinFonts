@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -299,12 +300,100 @@ def canonical_future_path(path: Path, label: str) -> Path:
 
 
 def safe_filename(value: str) -> str:
-    value = value.strip().replace(os.sep, "-")
+    value = unicodedata.normalize("NFKC", value).strip().replace(os.sep, "-")
     if os.altsep:
         value = value.replace(os.altsep, "-")
-    value = re.sub(r"[^A-Za-z0-9._+() -]+", "-", value)
+    value = re.sub(r"[^\w.+() -]+", "-", value, flags=re.UNICODE)
     value = re.sub(r"[ .-]+", "-", value).strip("-._")
-    return value[:120] or "font"
+    if len(value.encode("utf-8")) > 120:
+        shortened: list[str] = []
+        byte_count = 0
+        for char in value:
+            char_size = len(char.encode("utf-8"))
+            if byte_count + char_size > 120:
+                break
+            shortened.append(char)
+            byte_count += char_size
+        value = "".join(shortened).rstrip("-._ ")
+    return value or "font"
+
+
+def looks_opaque_font_stem(value: str) -> bool:
+    stem = value.strip()
+    lowered = stem.casefold()
+    compact = "".join(char for char in stem if char.isalnum())
+    ascii_compact = re.sub(r"[^A-Za-z0-9]", "", stem)
+    if not compact:
+        return True
+    if re.fullmatch(r"font[-_ ]?[0-9a-f]{8,}", lowered):
+        return True
+    if re.fullmatch(r"[0-9a-f]{16,}", ascii_compact, flags=re.IGNORECASE):
+        return True
+    if re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        lowered,
+    ):
+        return True
+    # Office and Windows resource stores sometimes expose opaque alphanumeric
+    # identifiers instead of filenames. Avoid treating long, digit-heavy IDs
+    # as user-facing font names.
+    if len(compact) >= 24 and compact.isalnum() and sum(char.isdigit() for char in compact) >= 4:
+        return True
+    return False
+
+
+def first_fontconfig_name(value: str) -> str:
+    # Fontconfig renders localized name lists separated by commas. The first
+    # value is its preferred name for the current locale.
+    return (value or "").split(",", 1)[0].strip()
+
+
+def metadata_font_stem(cand: Candidate) -> str:
+    if not cand.faces:
+        return ""
+
+    if len(cand.faces) > 1:
+        families: list[str] = []
+        seen: set[str] = set()
+        for face in cand.faces:
+            family = first_fontconfig_name(face.family)
+            key = norm(family)
+            if family and key not in seen and not looks_opaque_font_stem(family):
+                seen.add(key)
+                families.append(family)
+        if families:
+            return f"{families[0]} Collection"
+
+    face = cand.faces[0]
+    family = first_fontconfig_name(face.family)
+    style = first_fontconfig_name(face.style)
+    fullname = first_fontconfig_name(face.fullname)
+    postscript = first_fontconfig_name(face.postscript)
+    family_and_style = family
+    if family and style and norm(style) not in {"regular", "normal", "roman"}:
+        family_and_style = f"{family} {style}"
+
+    for value in (fullname, postscript, family_and_style, family):
+        if value and not looks_opaque_font_stem(value):
+            return value
+    return ""
+
+
+def preferred_installed_filename(cand: Candidate) -> str:
+    original = Path(cand.original_filename).name
+    original_suffix = Path(original).suffix.casefold()
+    path_suffix = cand.path.suffix.casefold()
+    extension = original_suffix if original_suffix in FONT_EXTS else path_suffix
+    if extension not in FONT_EXTS:
+        extension = ".ttf"
+
+    original_stem = Path(original).stem
+    clean_original = safe_filename(original_stem)
+    if clean_original == "font" or looks_opaque_font_stem(original_stem):
+        clean_metadata = safe_filename(metadata_font_stem(cand))
+        if clean_metadata != "font":
+            return f"{clean_metadata}{extension}"
+    return f"{clean_original}{extension}"
 
 
 def sha256_file(path: Path) -> str:
@@ -901,26 +990,44 @@ def build_candidate_metadata(candidates: list[Candidate]) -> None:
             cand.reason = "fc-scan-no-faces"
 
 
-def choose_target(dest: Path, cand: Candidate) -> tuple[Path, str]:
-    stem = safe_filename(cand.original_filename)
-    target = dest / f"{cand.sha256}_{stem}"
-    if not target.exists() and not target.is_symlink():
-        return target, "new-file"
+def target_content_state(target: Path, digest: str, reserved: dict[Path, str]) -> str:
+    if target in reserved:
+        return "identical" if reserved[target] == digest else "occupied"
     if target.is_symlink():
-        return next_free_target(dest, cand, stem), "filename-collision-symlink"
+        return "symlink"
     if target.is_file():
-        existing_hash = sha256_file(target)
-        if existing_hash == cand.sha256:
-            return target, "identical-file"
-        return next_free_target(dest, cand, stem), "filename-collision"
-    return next_free_target(dest, cand, stem), "filename-collision"
+        return "identical" if sha256_file(target) == digest else "occupied"
+    if target.exists():
+        return "occupied"
+    return "free"
 
 
-def next_free_target(dest: Path, cand: Candidate, stem: str) -> Path:
-    for index in range(2, 10000):
-        target = dest / f"{cand.sha256}_{index}_{stem}"
-        if not target.exists() and not target.is_symlink():
-            return target
+def choose_target(
+    dest: Path,
+    cand: Candidate,
+    reserved: dict[Path, str] | None = None,
+) -> tuple[Path, str]:
+    reserved = reserved if reserved is not None else {}
+    filename = preferred_installed_filename(cand)
+    target = dest / filename
+    state = target_content_state(target, cand.sha256, reserved)
+    if state == "free":
+        return target, "new-file"
+    if state == "identical":
+        return target, "identical-file"
+
+    reason = "filename-collision-symlink" if state == "symlink" else "filename-collision"
+    stem = Path(filename).stem
+    extension = Path(filename).suffix
+    digest_suffix = cand.sha256[:12]
+    for index in range(1, 10000):
+        suffix = digest_suffix if index == 1 else f"{digest_suffix}-{index}"
+        candidate_target = dest / f"{stem}-{suffix}{extension}"
+        candidate_state = target_content_state(candidate_target, cand.sha256, reserved)
+        if candidate_state == "free":
+            return candidate_target, reason
+        if candidate_state == "identical":
+            return candidate_target, "identical-file"
     raise WinfontsError(f"could not choose collision-free filename for {cand.original_filename}", EXIT_IO)
 
 
@@ -944,6 +1051,7 @@ def decide_candidates(
 ) -> dict[str, int]:
     exact_index, face_index = installed_font_index()
     content_seen: set[str] = set()
+    reserved_targets: dict[Path, str] = {}
     counters: dict[str, int] = {}
 
     for cand in candidates:
@@ -957,7 +1065,7 @@ def decide_candidates(
             counters[cand.reason] = counters.get(cand.reason, 0) + 1
             continue
 
-        target, target_state = choose_target(candidate_dest(cand, dest), cand)
+        target, target_state = choose_target(candidate_dest(cand, dest), cand, reserved_targets)
         cand.target = target
         if target_state == "identical-file" and duplicate_policy != "keep-all":
             cand.state = "skip"
@@ -1004,6 +1112,8 @@ def decide_candidates(
             cand.state = "install"
             cand.reason = target_state
 
+        if cand.state == "install":
+            reserved_targets[target] = cand.sha256
         content_seen.add(cand.sha256)
         add_candidate_to_indexes(cand, exact_index, face_index)
         counters[cand.reason] = counters.get(cand.reason, 0) + 1

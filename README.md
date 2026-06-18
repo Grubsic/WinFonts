@@ -86,6 +86,11 @@ All candidates from all sources are deduplicated together before installation.
 Windows fonts go to the Windows folder, Office fonts go to the Office folder,
 unless you override the destination with `--dest`.
 
+Installed files keep readable source names. If Windows or Office exposes an
+opaque resource identifier, `winfonts` derives the filename from the font's
+internal family/style metadata. A short hash is added only for a real filename
+collision.
+
 ## Dry Run
 
 Use `scan`, `preview`, `dry-run`, or `install --dry-run`:
