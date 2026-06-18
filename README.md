@@ -1,123 +1,250 @@
 # winfonts
 
 `winfonts` extracts Microsoft fonts from Windows and Office media on Linux. It
-installs only missing fonts, records every installed file in a manifest, and can
-roll the install back safely.
+validates every font, skips duplicates, installs readable filenames, records
+what it changed, and can safely undo the installation later.
 
-## Quick Start
+It does not download or redistribute fonts. You provide the Windows or Office
+media and remain responsible for complying with its license.
 
-Check dependencies:
+## Quick start
+
+Make the launcher executable after downloading or cloning:
+
+```sh
+chmod +x winfonts
+```
+
+Open the guided menu:
+
+```sh
+./winfonts
+```
+
+The menu can scan, install, list, verify, and uninstall fonts without requiring
+you to remember command-line options. It is also available explicitly:
+
+```sh
+./winfonts interactive
+./winfonts menu
+./winfonts wizard
+```
+
+For command-line use:
 
 ```sh
 ./winfonts doctor
-```
-
-Preview an Office IMG without installing anything:
-
-```sh
 ./winfonts scan /path/to/Office.img --office-x-none-only
-```
-
-Install from an Office IMG:
-
-```sh
 ./winfonts install /path/to/Office.img --office-x-none-only
-```
-
-Preview your mounted Office IMG:
-
-```sh
-./winfonts scan /run/media/milenko/16.0.17928.20148 --office-x-none-only
-```
-
-Install from a Windows ISO:
-
-```sh
-./winfonts install /path/to/Windows.iso
-```
-
-Rollback:
-
-```sh
+./winfonts list
+./winfonts status
 ./winfonts uninstall --dry-run
 ./winfonts uninstall
 ```
 
-## Common Commands
+## Commands
 
-```sh
-./winfonts paths
-./winfonts scan SOURCE [SOURCE ...]
-./winfonts install SOURCE [SOURCE ...]
-./winfonts status
-./winfonts uninstall
-```
+| Command | Purpose |
+| --- | --- |
+| `interactive` | Open the guided menu. This is automatic when no command is given in a terminal. |
+| `doctor` | Check core and source-specific dependencies. |
+| `scan SOURCE...` | Preview extraction and installation without writing font files. |
+| `install SOURCE...` | Extract, validate, deduplicate, and install fonts. |
+| `images SOURCE` | List Windows editions contained in WIM/ESD media. |
+| `list` | List font files managed by `winfonts` and verify each one. |
+| `status` | Summarize valid, missing, modified, or unsafe managed files. |
+| `paths [SOURCE...]` | Show default paths and source-specific destinations. |
+| `uninstall` | Remove files safely using the installation manifest. |
+| `help [COMMAND]` | Show general or command-specific help. |
+| `version` | Show the installed version. |
 
 Useful aliases:
 
-```sh
-./winfonts preview SOURCE
-./winfonts dry-run SOURCE
-./winfonts rollback
-./winfonts check
-./winfonts where
+```text
+add                         install
+preview, dry-run            scan
+list-images, editions       images
+installed                   list
+verify                      status
+rollback, remove            uninstall
+check                       doctor
+where                       paths
+menu, wizard                interactive
 ```
 
-## Supported Sources
-
-You can pass one or more sources in the same command:
-
-- Windows ISO/IMG files
-- Mounted Windows setup media
-- `install.wim` or `install.esd`
-- An installed Windows partition containing `Windows/Fonts`
-- Office IMG files
-- Mounted Office Click-to-Run media
-- Loose directories containing `.ttf`, `.otf`, `.ttc`, or `.otc` fonts
-
-Examples:
+Detailed help is available in either style:
 
 ```sh
-./winfonts scan Office1.img Office2.img --office-x-none-only
-./winfonts install Windows.iso Office.img --office-x-none-only --dry-run
+./winfonts help install
+./winfonts install --help
 ```
 
-All candidates from all sources are deduplicated together before installation.
-Windows fonts go to the Windows folder, Office fonts go to the Office folder,
-unless you override the destination with `--dest`.
+Misspelled commands receive a suggestion when a close match exists.
 
-Installed files keep readable source names. If Windows or Office exposes an
-opaque resource identifier, `winfonts` derives the filename from the font's
-internal family/style metadata. A short hash is added only for a real filename
-collision.
+## Interactive mode
 
-## Dry Run
+Run `./winfonts` in a terminal and choose an action from the menu. The wizard:
 
-Use `scan`, `preview`, `dry-run`, or `install --dry-run`:
+- accepts paths containing spaces;
+- supports multiple sources in one run;
+- offers the recommended fast Office scan;
+- exposes destination, manifest, architecture, language, and image-index
+  options only when requested;
+- asks for confirmation before installing;
+- always previews an uninstall before asking for confirmation.
+
+Regular non-interactive commands retain their existing behavior, making them
+safe to use in scripts.
+
+## Supported sources
+
+One command may receive one or more sources:
+
+- Windows ISO or IMG files;
+- mounted Windows setup media;
+- `install.wim`, `install.esd`, or a directory containing either;
+- an installed Windows partition containing `Windows/Fonts`;
+- Office Click-to-Run IMG files or mounted media;
+- directories containing loose `.ttf`, `.otf`, `.ttc`, or `.otc` files.
+
+All candidates from all sources are deduplicated together:
 
 ```sh
+./winfonts scan Windows.iso Office.img --office-x-none-only
+./winfonts install Office1.img Office2.img --office-x-none-only
+```
+
+Windows, Office, and loose-font sources use separate destination folders unless
+`--dest` overrides them.
+
+## Preview before installing
+
+`scan` makes the same extraction and duplicate decisions as `install`, but does
+not write font files or update the manifest:
+
+```sh
+./winfonts scan /path/to/Windows.iso
 ./winfonts scan /path/to/Office.img --office-x-none-only
-./winfonts install /path/to/Office.img --office-x-none-only --dry-run
-./winfonts install /path/to/Office.img --office-x-none-only -n
+./winfonts install /path/to/source --dry-run
 ```
 
-Dry run prints every font that would be installed:
+Example:
 
 ```text
-would install: Calibri.ttf [new-file] -> /home/me/.local/share/fonts/microsoft-fonts/office/...
-Would install: 12
-Skipped/invalid: 40
+would install: ba67safs67d6asd6732h23f7uhn2809vgh29.ttf [new-file] -> /home/me/.local/share/fonts/microsoft-fonts/office/Aptos-Bold.ttf
+Would install: 1
+Skipped/invalid: 0
 ```
 
-## Default Paths
+Readable source filenames are preserved. If Windows or Office exposes an opaque
+resource identifier, `winfonts` derives a filename from the font's internal
+family and style metadata. A short hash is added only when two different files
+would otherwise use the same filename.
 
-Show paths:
+## Office media
+
+The recommended first pass scans language-neutral Office resources:
+
+```sh
+./winfonts scan Office.img --office-x-none-only
+./winfonts install Office.img --office-x-none-only
+```
+
+Useful Office options:
+
+```sh
+./winfonts scan Office.img --office-arch x64
+./winfonts scan Office.img --office-arch all
+./winfonts scan Office.img --office-language en-us
+```
+
+- `--office-x-none-only` usually finds shared Office fonts much faster.
+- `--office-arch` accepts `x64`, `x86`, or `all`; its default is `x64`.
+- `--office-language TAG` may be repeated to include language-specific streams.
+
+## Windows media
+
+Windows setup media defaults to image index `1`. Most Windows fonts are shared
+between editions, so this is normally enough:
+
+```sh
+./winfonts scan Windows.iso
+./winfonts install Windows.iso
+```
+
+To select another edition:
+
+```sh
+./winfonts images Windows.iso
+./winfonts install Windows.iso --image 6
+```
+
+`wimlib-imagex` is required for Windows ISO, WIM, and ESD sources but is not
+required for Office or loose-font directories.
+
+## Inspecting managed fonts
+
+List every managed file:
+
+```sh
+./winfonts list
+```
+
+Example:
+
+```text
+[ok] Aptos Bold -> /home/me/.local/share/fonts/microsoft-fonts/office/Aptos-Bold.ttf
+Total: 1
+```
+
+Show only status totals:
+
+```sh
+./winfonts status
+```
+
+Both commands support JSON for scripts:
+
+```sh
+./winfonts list --json
+./winfonts status --json
+```
+
+Possible verification states include `ok`, `missing`, `modified`, `symlink`,
+and `malformed`.
+
+## Uninstalling
+
+Always preview first:
+
+```sh
+./winfonts uninstall --dry-run
+```
+
+Then remove the managed files:
+
+```sh
+./winfonts uninstall
+```
+
+For a custom manifest:
+
+```sh
+./winfonts uninstall --manifest /path/to/manifest.jsonl
+```
+
+Uninstall verifies every file hash. Missing, modified, unsafe, or unexpected
+files are not deleted; their records remain in the manifest for inspection.
+
+## Paths and custom destinations
+
+Show defaults:
 
 ```sh
 ./winfonts paths
 ```
 
-Defaults:
+Default per-user locations:
 
 ```text
 Windows fonts: ~/.local/share/fonts/microsoft-fonts/windows
@@ -126,78 +253,76 @@ Loose fonts:   ~/.local/share/fonts/microsoft-fonts/loose
 Manifest:      ~/.local/state/microsoft-fonts/manifest.jsonl
 ```
 
-Show where specific sources would install:
+Classify sources and show where each would install:
 
 ```sh
 ./winfonts paths Windows.iso Office.img
 ```
 
-Override paths:
+Override the destination or manifest:
 
 ```sh
 ./winfonts install Office.img \
   --office-x-none-only \
-  --dest "$HOME/.local/share/fonts/microsoft-fonts/office" \
-  --manifest "$HOME/.local/state/microsoft-fonts/manifest.jsonl"
+  --dest "$HOME/.local/share/fonts/my-office-fonts" \
+  --manifest "$HOME/.local/state/winfonts-office.jsonl"
 ```
 
-Short options:
+Common short options:
 
 ```text
 -n, --dry-run       Preview only.
 -o, --dest DIR      Override the font destination.
 -m, --manifest PATH Override the manifest path.
--i, --image N       Windows WIM/ESD image index override.
+-i, --image N       Override the Windows WIM/ESD image index.
 ```
 
-## Office Options
-
-Recommended first pass:
+Duplicate policy options:
 
 ```sh
-./winfonts scan Office.img --office-x-none-only
+./winfonts install SOURCE --duplicate-policy skip-existing
+./winfonts install SOURCE --duplicate-policy prefer-newer
+./winfonts install SOURCE --duplicate-policy prefer-source
+./winfonts install SOURCE --duplicate-policy keep-all
 ```
 
-Useful filters:
+The default is `skip-existing`.
+
+## Dependencies
+
+Check the current machine:
 
 ```sh
-./winfonts scan Office.img --office-x-none-only --office-arch x64
-./winfonts scan Office.img --office-language en-us
+./winfonts doctor
 ```
 
-`--office-x-none-only` scans language-neutral streams first. It is usually much
-faster and catches the shared Office font resources.
+Core requirements:
 
-## Windows Options
+- Python 3;
+- Fontconfig tools: `fc-scan`, `fc-list`, and `fc-cache`;
+- the bundled `office_font_carver.py`.
 
-Windows setup media defaults to image index `1`, which is normally enough for
-font extraction:
+Source-specific tools:
 
-```sh
-./winfonts install Windows.iso
-```
+- `mount` and `umount` when opening ISO/IMG files directly;
+- `wimlib-imagex` for Windows ISO/WIM/ESD sources.
 
-If you need a specific Windows edition inside the ISO:
+Missing source-specific tools are reported as optional because Office media,
+mounted directories, and loose-font folders may still work.
 
-```sh
-./winfonts images Windows.iso
-./winfonts install Windows.iso --image N
-```
+## Mount permissions and sudo
 
-## Sudo And Mounting
-
-For ISO/IMG files, `winfonts` tries a read-only loop mount. Some distros require
-root for that:
+Some distributions restrict loop mounting to root:
 
 ```sh
 sudo ./winfonts scan Office.img --office-x-none-only
 sudo ./winfonts install Windows.iso
 ```
 
-When run with `sudo`, defaults still target the original `SUDO_USER` home, not
-`/root`.
+When run through `sudo`, `winfonts` targets the original `SUDO_USER` home rather
+than `/root`.
 
-You can also mount manually:
+You may also mount media yourself:
 
 ```sh
 sudo mount -o loop,ro Office.img /mnt/office
@@ -205,53 +330,48 @@ sudo mount -o loop,ro Office.img /mnt/office
 sudo umount /mnt/office
 ```
 
-## Safety
-
-- Installs into per-user font directories by default.
-- Does not modify system font directories.
-- Copies through a temporary file and atomically renames after validation.
-- Records installed files in a JSON Lines manifest.
-- Uninstall verifies hashes before deleting files.
-- Modified or unexpected files are not deleted during rollback.
-- A lock prevents install and uninstall from running at the same time.
-
-## Requirements
-
-- `python3`
-- `fontconfig`: `fc-scan`, `fc-list`, `fc-cache`
-- `mount` and `umount` for direct ISO/IMG input
-- `wimlib-imagex` for Windows ISO/WIM/ESD sources
-
-Office extraction uses Python's standard library and the bundled
-`office_font_carver.py`.
-
-## Command Reference
-
-```text
-install     Install missing fonts from one or more sources.
-scan        Dry-run install decisions without writing font files.
-preview     Alias for scan.
-dry-run     Alias for scan.
-images      List Windows WIM/ESD image indexes.
-status      Verify installed files against the manifest.
-verify      Alias-style status check.
-uninstall   Roll back installed fonts.
-rollback    Alias for uninstall.
-doctor      Check dependencies.
-check       Alias for doctor.
-paths       Show default folders and source destinations.
-where       Alias for paths.
-version     Show version.
-```
-
-Run command-specific help:
+If the project was copied from Windows and `./winfonts` reports `sh\r`, ensure
+Git respects the included `.gitattributes`, or run:
 
 ```sh
-./winfonts install --help
-./winfonts scan --help
+git add --renormalize winfonts
+git checkout -- winfonts
+chmod +x winfonts
 ```
 
-## License Note
+## Safety model
 
-This tool does not download or redistribute fonts. It only extracts fonts from
-media you provide. Make sure your Windows or Office license allows your use.
+- Default installs are per-user, not system-wide.
+- Sources are opened read-only.
+- Fonts are validated with Fontconfig before and after copying.
+- Copies use a temporary file followed by an atomic rename.
+- Content hashes prevent accidental duplicate installation.
+- Planned filenames are reserved to prevent same-run overwrites.
+- Every installed file is recorded in a JSON Lines manifest.
+- Uninstall verifies hashes before deleting anything.
+- A lock prevents install, uninstall, and status operations from racing.
+- Failed transactions roll back files already copied by that transaction.
+
+## Exit codes
+
+| Code | Meaning |
+| ---: | --- |
+| `0` | Success |
+| `2` | Invalid command, option, source type, or missing core dependency |
+| `3` | Required source or manifest not found |
+| `4` | No fonts found |
+| `5` | Nothing new was installed because candidates were duplicates |
+| `6` | Partial operation or incomplete transaction |
+| `7` | Verification found modified or unsafe files |
+| `8` | Another operation holds the lock |
+| `10` | Filesystem or I/O failure |
+| `130` | Interrupted |
+
+## Development
+
+Run the test suite on Linux:
+
+```sh
+python3 -m unittest discover -s tests -v
+python3 -m py_compile winfonts_engine.py office_font_carver.py
+```

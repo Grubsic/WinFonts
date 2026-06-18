@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 APP = "winfonts"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 SCHEMA = 2
 HASH_ALGO = "sha256"
 FONT_EXTS = {".ttf", ".otf", ".ttc", ".otc"}
@@ -1456,23 +1456,145 @@ def status_command(args: argparse.Namespace) -> int:
     if args.manifest is not None:
         reject_bad_path_text(args.manifest, "--manifest")
     manifest_arg = Path(args.manifest) if args.manifest is not None else default_manifest()
-    manifest = canonical_for_create(manifest_arg, "manifest", create_parent=True)
+    manifest = canonical_future_path(manifest_arg, "manifest")
     if not manifest.exists():
-        out(f"No manifest found: {manifest}")
+        if getattr(args, "json", False):
+            out(
+                json.dumps(
+                    {
+                        "manifest": str(manifest),
+                        "exists": False,
+                        "status": {
+                            "ok": 0,
+                            "missing": 0,
+                            "modified": 0,
+                            "symlink": 0,
+                            "malformed": 0,
+                        },
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            out(f"No manifest found: {manifest}")
         return EXIT_OK
     with Lock(manifest.parent / ".lock"):
         _records, counters = verify_records(manifest)
+    if getattr(args, "json", False):
+        out(
+            json.dumps(
+                {
+                    "manifest": str(manifest),
+                    "exists": True,
+                    "status": counters,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return EXIT_VERIFY if verification_failed(counters) else EXIT_OK
     out(f"Manifest: {manifest}")
     for key in ("ok", "missing", "modified", "symlink", "malformed"):
         out(f"{key}: {counters[key]}")
-    return EXIT_VERIFY if any(counters[key] for key in ("modified", "symlink", "malformed")) else EXIT_OK
+    return EXIT_VERIFY if verification_failed(counters) else EXIT_OK
+
+
+def record_display_name(record: dict[str, Any]) -> str:
+    faces = record.get("faces")
+    if isinstance(faces, list) and faces:
+        face = faces[0] if isinstance(faces[0], dict) else {}
+        fullname = str(face.get("fullname", "")).strip()
+        family = str(face.get("family", "")).strip()
+        style = str(face.get("style", "")).strip()
+        if fullname:
+            return first_fontconfig_name(fullname)
+        if family:
+            if style and norm(style) not in {"regular", "normal", "roman"}:
+                return f"{first_fontconfig_name(family)} {first_fontconfig_name(style)}"
+            return first_fontconfig_name(family)
+    return str(record.get("installed_filename") or record.get("original_filename") or "unknown font")
+
+
+def verification_failed(counters: dict[str, int]) -> bool:
+    return any(counters.get(key, 0) for key in ("missing", "modified", "symlink", "malformed"))
+
+
+def list_command(args: argparse.Namespace) -> int:
+    if args.manifest is not None:
+        reject_bad_path_text(args.manifest, "--manifest")
+    manifest_arg = Path(args.manifest) if args.manifest is not None else default_manifest()
+    manifest = canonical_future_path(manifest_arg, "manifest")
+    if not manifest.exists():
+        if args.json:
+            out(
+                json.dumps(
+                    {
+                        "manifest": str(manifest),
+                        "exists": False,
+                        "count": 0,
+                        "status": {
+                            "ok": 0,
+                            "missing": 0,
+                            "modified": 0,
+                            "symlink": 0,
+                            "malformed": 0,
+                        },
+                        "fonts": [],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            out(f"No manifest found: {manifest}")
+        return EXIT_OK
+
+    with Lock(manifest.parent / ".lock"):
+        records, counters = verify_records(manifest)
+    fonts: list[dict[str, Any]] = []
+    for record in records:
+        if record.get("record") != "font_file":
+            continue
+        fonts.append(
+            {
+                "name": record_display_name(record),
+                "status": str(record.get("_status", "unknown")),
+                "path": str(record.get("dest_path", "")),
+                "source": str(record.get("source_path", "")),
+                "installed_at": str(record.get("installed_at", "")),
+            }
+        )
+
+    if args.json:
+        out(
+            json.dumps(
+                {
+                    "manifest": str(manifest),
+                    "exists": True,
+                    "count": len(fonts),
+                    "status": counters,
+                    "fonts": fonts,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        out(f"Installed fonts recorded in: {manifest}")
+        if not fonts:
+            out("No installed font records.")
+        for font in fonts:
+            out(f"[{font['status']}] {font['name']} -> {font['path']}")
+        out(f"Total: {len(fonts)}")
+    return EXIT_VERIFY if verification_failed(counters) else EXIT_OK
 
 
 def uninstall_command(args: argparse.Namespace) -> int:
     if args.manifest is not None:
         reject_bad_path_text(args.manifest, "--manifest")
     manifest_arg = Path(args.manifest) if args.manifest is not None else default_manifest()
-    manifest = canonical_for_create(manifest_arg, "manifest", create_parent=True)
+    manifest = canonical_future_path(manifest_arg, "manifest")
     if not manifest.exists():
         raise WinfontsError(f"manifest not found: {manifest}", EXIT_NOT_FOUND)
     with Lock(manifest.parent / ".lock"):
@@ -1555,18 +1677,29 @@ def images_command(args: argparse.Namespace) -> int:
 
 
 def doctor_command(_args: argparse.Namespace) -> int:
-    required = ["python3", "fc-scan", "fc-list", "fc-cache", "mount", "umount"]
+    required = ["python3", "fc-scan", "fc-list", "fc-cache"]
+    optional = {
+        "mount": "needed only when opening ISO/IMG files directly",
+        "umount": "needed only when opening ISO/IMG files directly",
+        "wimlib-imagex": "needed only for Windows ISO/WIM/ESD sources",
+    }
     ok = True
+    out("Core requirements:")
     for cmd in required:
         exists = command_exists(cmd)
-        out(f"{'ok' if exists else 'missing'}      {cmd}")
+        out(f"  {'ok' if exists else 'missing'}      {cmd}")
         ok = ok and exists
-    wim = command_exists("wimlib-imagex")
-    out(f"{'ok' if wim else 'missing'}      wimlib-imagex")
-    ok = ok and wim
-    out(f"{'ok' if OFFICE_CARVER.exists() else 'missing'}      {OFFICE_CARVER}")
+    out(f"  {'ok' if OFFICE_CARVER.exists() else 'missing'}      Office extractor")
     ok = ok and OFFICE_CARVER.exists()
-    out("ok      sha256")
+    out("  ok      SHA-256 support")
+    out("Source-specific tools:")
+    for cmd, note in optional.items():
+        exists = command_exists(cmd)
+        out(f"  {'ok' if exists else 'optional-missing'}      {cmd} ({note})")
+    if ok:
+        out("Result: ready. Missing optional tools only limit specific source types.")
+    else:
+        out("Result: core requirements are missing.")
     return EXIT_OK if ok else EXIT_USAGE
 
 
@@ -1587,6 +1720,8 @@ COMMAND_NAMES = (
     "editions",
     "status",
     "verify",
+    "list",
+    "installed",
     "uninstall",
     "rollback",
     "remove",
@@ -1594,6 +1729,10 @@ COMMAND_NAMES = (
     "check",
     "paths",
     "where",
+    "interactive",
+    "menu",
+    "wizard",
+    "help",
     "version",
 )
 
@@ -1662,6 +1801,238 @@ def paths_command(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def prompt_text(label: str, *, default: str | None = None, required: bool = False) -> str | None:
+    default_hint = f" [{default}]" if default is not None else ""
+    while True:
+        try:
+            value = input(f"{label}{default_hint}: ").strip()
+        except EOFError:
+            return None
+        if not value and default is not None:
+            return default
+        if value:
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            return value
+        if not required:
+            return ""
+        out("A value is required.")
+
+
+def prompt_yes_no(label: str, *, default: bool) -> bool | None:
+    hint = "Y/n" if default else "y/N"
+    while True:
+        value = prompt_text(f"{label} ({hint})")
+        if value is None:
+            return None
+        normalized = value.casefold()
+        if not normalized:
+            return default
+        if normalized in {"y", "yes", "s", "si", "sí"}:
+            return True
+        if normalized in {"n", "no"}:
+            return False
+        out("Please answer yes or no.")
+
+
+def prompt_choice(label: str, choices: dict[str, str], *, default: str) -> str | None:
+    while True:
+        value = prompt_text(label, default=default)
+        if value is None:
+            return None
+        if value in choices:
+            return value
+        out(f"Choose one of: {', '.join(choices)}")
+
+
+def interactive_sources() -> list[str] | None:
+    out("")
+    out("Enter one source at a time. Paths may contain spaces.")
+    out("Press Enter after the last source.")
+    sources: list[str] = []
+    while True:
+        source = prompt_text("Source path" if not sources else "Another source")
+        if source is None:
+            return None
+        if not source:
+            if sources:
+                return sources
+            out("Enter at least one source, or type 'cancel'.")
+            continue
+        if source.casefold() in {"cancel", "quit", "exit"}:
+            return None
+        sources.append(source)
+
+
+def interactive_source_options(sources: list[str]) -> list[str] | None:
+    out("")
+    out("Source type:")
+    out("  1) Automatic, Windows media, or a loose font folder")
+    out("  2) Office Click-to-Run media")
+    kind = prompt_choice("Select", {"1": "automatic", "2": "office"}, default="1")
+    if kind is None:
+        return None
+
+    argv = list(sources)
+    if kind == "2":
+        neutral = prompt_yes_no("Use the faster language-neutral Office scan", default=True)
+        if neutral is None:
+            return None
+        if neutral:
+            argv.append("--office-x-none-only")
+
+    advanced = prompt_yes_no("Configure advanced options", default=False)
+    if advanced is None:
+        return None
+    if not advanced:
+        return argv
+
+    if kind == "2":
+        arch = prompt_choice(
+            "Office architecture (x64/x86/all)",
+            {"x64": "", "x86": "", "all": ""},
+            default="x64",
+        )
+        if arch is None:
+            return None
+        argv.extend(["--office-arch", arch])
+        language = prompt_text("Optional Office language tag, for example en-us")
+        if language is None:
+            return None
+        if language:
+            argv.extend(["--office-language", language])
+    else:
+        image = prompt_text("Optional Windows image index")
+        if image is None:
+            return None
+        if image:
+            argv.extend(["--image", image])
+
+    dest = prompt_text("Optional custom font destination")
+    if dest is None:
+        return None
+    if dest:
+        argv.extend(["--dest", dest])
+    manifest = prompt_text("Optional custom manifest path")
+    if manifest is None:
+        return None
+    if manifest:
+        argv.extend(["--manifest", manifest])
+    return argv
+
+
+def run_interactive_action(parser: argparse.ArgumentParser, argv: list[str]) -> int:
+    try:
+        args = parser.parse_args(argv)
+        if getattr(args, "force", False):
+            args.duplicate_policy = "keep-all"
+        return int(args.func(args))
+    except SystemExit as exc:
+        return int(exc.code or EXIT_OK)
+    except WinfontsError as exc:
+        log(f"{APP}: {exc}")
+        return exc.code
+    except PermissionError as exc:
+        path = getattr(exc, "filename", None)
+        suffix = f": {path}" if path else ""
+        log(f"{APP}: permission denied{suffix}: {exc.strerror or exc}")
+        return EXIT_IO
+    except OSError as exc:
+        log(f"{APP}: operating-system error: {exc}")
+        return EXIT_IO
+
+
+def interactive_command(_args: argparse.Namespace) -> int:
+    parser = build_parser()
+    while True:
+        out("")
+        out(f"{display_prog()} interactive mode")
+        out("  1) Scan or preview fonts")
+        out("  2) Install fonts")
+        out("  3) List installed fonts")
+        out("  4) Check installation status")
+        out("  5) Uninstall fonts")
+        out("  6) Show paths")
+        out("  7) Check dependencies")
+        out("  8) List Windows editions")
+        out("  h) Help")
+        out("  q) Quit")
+        choice = prompt_text("Choose an action")
+        if choice is None or choice.casefold() in {"q", "quit", "exit", "0"}:
+            out("Goodbye.")
+            return EXIT_OK
+
+        normalized = choice.casefold()
+        if normalized in {"1", "2"}:
+            sources = interactive_sources()
+            if sources is None:
+                out("Cancelled.")
+                continue
+            options = interactive_source_options(sources)
+            if options is None:
+                out("Cancelled.")
+                continue
+            command = "scan" if normalized == "1" else "install"
+            if command == "install":
+                out("")
+                out("Ready to install from:")
+                for source in sources:
+                    out(f"  {source}")
+                confirmed = prompt_yes_no("Continue with installation", default=False)
+                if not confirmed:
+                    out("Installation cancelled.")
+                    continue
+            code = run_interactive_action(parser, [command, *options])
+            out(f"Command finished with exit code {code}.")
+            continue
+
+        if normalized == "3":
+            run_interactive_action(parser, ["list"])
+        elif normalized == "4":
+            run_interactive_action(parser, ["status"])
+        elif normalized == "5":
+            preview_code = run_interactive_action(parser, ["uninstall", "--dry-run"])
+            if preview_code != EXIT_OK:
+                out(f"Uninstall preview failed with exit code {preview_code}.")
+                continue
+            confirmed = prompt_yes_no("Remove the files shown above", default=False)
+            if confirmed:
+                run_interactive_action(parser, ["uninstall"])
+            else:
+                out("Uninstall cancelled.")
+        elif normalized == "6":
+            run_interactive_action(parser, ["paths"])
+        elif normalized == "7":
+            run_interactive_action(parser, ["doctor"])
+        elif normalized == "8":
+            source = prompt_text("Windows ISO, mounted media, WIM, or ESD path", required=True)
+            if source:
+                run_interactive_action(parser, ["images", source])
+            else:
+                out("Cancelled.")
+        elif normalized in {"h", "help", "?"}:
+            parser.print_help()
+        else:
+            out("Unknown selection. Choose a menu item.")
+
+
+def help_command(args: argparse.Namespace) -> int:
+    parser = build_parser()
+    topic = args.topic
+    if not topic:
+        parser.print_help()
+        return EXIT_OK
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            command_parser = action.choices.get(topic)
+            if command_parser is not None:
+                command_parser.print_help()
+                return EXIT_OK
+    suggestion = difflib.get_close_matches(topic, COMMAND_NAMES, n=1)
+    hint = f" Did you mean '{suggestion[0]}'?" if suggestion else ""
+    raise WinfontsError(f"unknown help topic: {topic}.{hint}", EXIT_USAGE)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = FriendlyParser(
         prog=display_prog(),
@@ -1672,6 +2043,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog="""\
 Common commands:
+  ./winfonts
+      Open the guided interactive menu when running in a terminal.
+
   ./winfonts doctor
       Check required tools.
 
@@ -1696,6 +2070,9 @@ Common commands:
   ./winfonts status
       Show whether installed files still match the manifest.
 
+  ./winfonts list
+      List font files recorded in the manifest.
+
   ./winfonts uninstall --dry-run
       Preview rollback of fonts installed by this tool.
 
@@ -1704,7 +2081,7 @@ Default install folders:
   Office sources:  ~/.local/share/fonts/microsoft-fonts/office
   Manifest:        ~/.local/state/microsoft-fonts/manifest.jsonl
 
-Use "./winfonts COMMAND --help" for command-specific options.
+Use "./winfonts help COMMAND" or "./winfonts COMMAND --help" for details.
 """,
     )
     parser.add_argument(
@@ -1789,6 +2166,11 @@ Examples:
         metavar="PATH",
         help="manifest to inspect",
     )
+    status.add_argument(
+        "--json",
+        action="store_true",
+        help="print machine-readable JSON",
+    )
     status.set_defaults(func=status_command)
 
     verify = sub.add_parser(
@@ -1802,7 +2184,37 @@ Examples:
         metavar="PATH",
         help="manifest to inspect",
     )
+    verify.add_argument(
+        "--json",
+        action="store_true",
+        help="print machine-readable JSON",
+    )
     verify.set_defaults(func=status_command)
+
+    installed = sub.add_parser(
+        "list",
+        aliases=("installed",),
+        formatter_class=HelpFormatter,
+        help="list installed fonts recorded in the manifest",
+        description="List every font file managed by winfonts and show its verification status.",
+        epilog="""\
+Examples:
+  ./winfonts list
+  ./winfonts list --json
+  ./winfonts installed --manifest ~/.local/state/microsoft-fonts/manifest.jsonl
+""",
+    )
+    installed.add_argument(
+        "--manifest",
+        metavar="PATH",
+        help="manifest to inspect",
+    )
+    installed.add_argument(
+        "--json",
+        action="store_true",
+        help="print machine-readable JSON",
+    )
+    installed.set_defaults(func=list_command)
 
     uninstall = sub.add_parser(
         "uninstall",
@@ -1864,6 +2276,35 @@ Examples:
         help="show where sources would install with this custom destination",
     )
     paths.set_defaults(func=paths_command)
+
+    interactive = sub.add_parser(
+        "interactive",
+        aliases=("menu", "wizard"),
+        formatter_class=HelpFormatter,
+        help="open the guided interactive menu",
+        description="Open a guided menu for scanning, installing, checking, and removing fonts.",
+    )
+    interactive.set_defaults(func=interactive_command)
+
+    help_parser = sub.add_parser(
+        "help",
+        formatter_class=HelpFormatter,
+        help="show general or command-specific help",
+        description="Show the main help page or detailed help for one command.",
+        epilog="""\
+Examples:
+  ./winfonts help
+  ./winfonts help install
+  ./winfonts help uninstall
+""",
+    )
+    help_parser.add_argument(
+        "topic",
+        metavar="COMMAND",
+        nargs="?",
+        help="command to explain",
+    )
+    help_parser.set_defaults(func=help_command)
 
     version = sub.add_parser(
         "version",
@@ -1952,7 +2393,10 @@ def add_source_decision_args(parser: argparse.ArgumentParser, *, include_dry_run
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    if not effective_argv and sys.stdin.isatty() and sys.stdout.isatty():
+        effective_argv = ["interactive"]
+    args = parser.parse_args(effective_argv)
     if args.command is None:
         parser.print_help()
         return EXIT_OK
