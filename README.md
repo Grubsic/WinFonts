@@ -39,6 +39,7 @@ For command-line use:
 ./winfonts install /path/to/Windows.iso --source-sha256 EXPECTED_SHA256
 ./winfonts list
 ./winfonts status
+./winfonts repair --dry-run
 ./winfonts uninstall --dry-run
 ./winfonts uninstall
 ```
@@ -54,6 +55,7 @@ For command-line use:
 | `images SOURCE` | List Windows editions contained in WIM/ESD media. |
 | `list` | List font files managed by `winfonts` and verify each one. |
 | `status` | Summarize valid, missing, modified, or unsafe managed files. |
+| `repair` | Safely forget invalid records or compact an inconsistent manifest. |
 | `paths [SOURCE...]` | Show default paths and source-specific destinations. |
 | `uninstall` | Remove files safely using the installation manifest. |
 | `help [COMMAND]` | Show general or command-specific help. |
@@ -68,6 +70,7 @@ list-images, editions       images
 installed                   list
 verify                      status
 rollback, remove            uninstall
+fix-manifest                repair
 check                       doctor
 where                       paths
 menu, wizard                interactive
@@ -174,6 +177,10 @@ without executing Windows installers:
 ./winfonts install /path/to/legacy-office-media
 ```
 
+Nested CAB/MSI payloads are processed recursively with content deduplication
+and a safety limit. Individual extraction failures are reported with the
+payload path and tool output while other payloads continue.
+
 Loose font files found in modern Office media are copied before opaque
 Click-to-Run streams are carved.
 
@@ -205,7 +212,15 @@ EXPECTED_SHA256="replace-with-the-64-hex-digit-published-checksum"
 ./winfonts install Windows.iso --source-sha256 "$EXPECTED_SHA256"
 ```
 
-This option accepts one regular-file source at a time.
+For multiple media files, repeat the option and identify each source:
+
+```sh
+./winfonts install Windows.iso Office.img \
+  --source-sha256 "Windows.iso=$WINDOWS_SHA256" \
+  --source-sha256 "Office.img=$OFFICE_SHA256"
+```
+
+Only regular-file sources can be hashed; mounted directories cannot.
 
 ## Inspecting managed fonts
 
@@ -237,6 +252,34 @@ Both commands support JSON for scripts:
 
 Possible verification states include `ok`, `missing`, `modified`, `symlink`,
 and `malformed`.
+
+Installation requires a clean manifest. If `status` reports any invalid state,
+`install` stops before extraction or copying so a missing file cannot be
+reinstalled over a stale record.
+
+## Repairing the manifest
+
+Preview every applicable repair:
+
+```sh
+./winfonts repair --dry-run
+```
+
+Apply only explicitly selected changes:
+
+```sh
+./winfonts repair --drop-missing --compact
+./winfonts repair --drop-modified --drop-symlink --compact
+./winfonts repair --recover-pending
+```
+
+Normal repair options modify only the manifest and never alter or follow a font
+file or symlink. `--recover-pending` may remove a regular file
+listed in an interrupted-install journal when its SHA-256 still matches the
+planned copy. Already committed files and changed files are preserved.
+`--compact` resolves duplicate destination records by keeping the newest record
+whose file still verifies, then removes transaction records no longer
+referenced by a managed font.
 
 ## Uninstalling
 
@@ -307,7 +350,7 @@ Duplicate policy options:
 ```sh
 ./winfonts install SOURCE --duplicate-policy skip-existing
 ./winfonts install SOURCE --duplicate-policy prefer-newer
-./winfonts install SOURCE --duplicate-policy prefer-source
+./winfonts install SOURCE --duplicate-policy install-source
 ./winfonts install SOURCE --duplicate-policy keep-all
 ```
 
@@ -315,10 +358,11 @@ The default is `skip-existing`.
 
 - `skip-existing` skips identical metadata and older versions.
 - `prefer-newer` installs only new faces or newer revisions.
-- `prefer-source` installs the supplied source unless its exact file content is
-  already at the target.
-- `keep-all` always chooses a new filename and never overwrites a pre-existing
-  file.
+- `install-source` installs the supplied source side-by-side unless its exact
+  file content already exists at the selected target. The old name
+  `prefer-source` remains as a deprecated alias.
+- `keep-all` preserves exact duplicates too, always chooses new filenames, and
+  never overwrites a pre-existing file.
 
 ## Dependencies
 
@@ -356,7 +400,9 @@ sudo ./winfonts install Windows.iso
 
 If 7-Zip is installed, `winfonts` automatically falls back to extracting an
 ISO/IMG into a temporary directory when a read-only loop mount is unavailable.
-This avoids `sudo` at the cost of additional temporary disk space.
+It lists the image first, checks free space, and extracts only the relevant
+Windows WIM/ESD, Office streams, legacy payloads, or loose fonts when the media
+layout is recognizable. Unknown layouts use a checked full-image fallback.
 
 When run through `sudo`, `winfonts` targets the original `SUDO_USER` home rather
 than `/root`.
@@ -382,8 +428,10 @@ chmod +x winfonts
 
 - Default installs are per-user, not system-wide.
 - Sources are opened read-only.
+- Symlinked source candidates and unsafe archive paths are rejected.
 - Fonts are validated with Fontconfig before and after copying.
-- Copies use a temporary file followed by an atomic rename.
+- Copies use a verified temporary file and an atomic create-only hard link, so
+  a target created after planning is never overwritten.
 - Content hashes prevent accidental duplicate installation.
 - `keep-all` never reuses or overwrites an existing pathname.
 - Planned filenames are reserved to prevent same-run overwrites.
@@ -391,7 +439,17 @@ chmod +x winfonts
 - `--source-sha256` verifies media before extraction and records its provenance.
 - Uninstall verifies hashes before deleting anything.
 - A lock prevents install, uninstall, and status operations from racing.
+- Destination-specific locks also serialize operations that use different
+  manifests but write to the same font directory.
 - Failed transactions roll back files already copied by that transaction.
+- Before copying, installs persist a pending journal containing every planned
+  destination and SHA-256. After an abrupt process or power failure,
+  `repair --recover-pending` removes only matching uncommitted files.
+- A failed manifest write always returns an error after rollback, even when the
+  aborted transaction can be recorded successfully.
+- Duplicate-only installs do not add empty transactions to the manifest.
+- Manifest renames and font-directory mutations are followed by directory
+  `fsync` calls for stronger Linux crash durability.
 
 ## Licensing and redistribution
 

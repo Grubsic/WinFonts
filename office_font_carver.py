@@ -345,12 +345,14 @@ class Carver:
         dry_run: bool,
         max_font_size: int,
         source_path: str,
+        keep_duplicates: bool = False,
         records: TextIO | None = None,
     ) -> None:
         self.output = output
         self.dry_run = dry_run
         self.max_font_size = max_font_size
         self.source_path = source_path
+        self.keep_duplicates = keep_duplicates
         self.records = records
         self.buffer = bytearray()
         self.base = 0
@@ -427,7 +429,7 @@ class Carver:
 
     def _save(self, blob: bytes, extension: str, offset: int) -> None:
         digest = hashlib.sha256(blob).hexdigest()
-        if digest in self.hashes:
+        if digest in self.hashes and not self.keep_duplicates:
             self.duplicates += 1
             return
         self.hashes.add(digest)
@@ -437,7 +439,10 @@ class Carver:
         suffix = 2
         while target.exists():
             try:
-                if hashlib.sha256(target.read_bytes()).hexdigest() == digest:
+                if (
+                    not self.keep_duplicates
+                    and hashlib.sha256(target.read_bytes()).hexdigest() == digest
+                ):
                     self.duplicates += 1
                     return
             except OSError:
@@ -700,7 +705,7 @@ def copy_loose_fonts(root: Path, output: Path, dry_run: bool, carver: Carver) ->
         except OSError:
             continue
         digest = hashlib.sha256(blob).hexdigest()
-        if digest in carver.hashes:
+        if digest in carver.hashes and not carver.keep_duplicates:
             carver.duplicates += 1
             continue
         carver.hashes.add(digest)
@@ -766,6 +771,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--arch", choices=("x64", "x86", "all"), default="x64")
     parser.add_argument("--language", action="append", default=[])
     parser.add_argument("--include-compat", action="store_true")
+    parser.add_argument("--keep-duplicates", action="store_true")
     parser.add_argument("--records", type=Path)
     parser.add_argument("--max-font-size", type=parse_size, default=DEFAULT_MAX_FONT)
     args = parser.parse_args(argv)
@@ -788,6 +794,7 @@ def main(argv: list[str] | None = None) -> int:
         dry_run=args.dry_run,
         max_font_size=args.max_font_size,
         source_path=str(source),
+        keep_duplicates=args.keep_duplicates,
         records=records_handle,
     )
     languages = {value.lower() for value in args.language}

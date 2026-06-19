@@ -1,6 +1,7 @@
 import argparse
 import io
 import json
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -19,6 +20,8 @@ class CommandLineTests(unittest.TestCase):
             (["wizard"], winfonts.interactive_command),
             (["list"], winfonts.list_command),
             (["installed"], winfonts.list_command),
+            (["repair"], winfonts.repair_command),
+            (["fix-manifest"], winfonts.repair_command),
             (["help", "install"], winfonts.help_command),
         ):
             with self.subTest(argv=argv):
@@ -130,7 +133,7 @@ class CommandLineTests(unittest.TestCase):
 
         digest = "A" * 64
         args = parser.parse_args(["scan", "/tmp/source", "--source-sha256", digest])
-        self.assertEqual(args.source_sha256, digest.casefold())
+        self.assertEqual(args.source_sha256, [digest.casefold()])
 
     def test_source_sha256_mismatch_stops_before_extraction(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -147,6 +150,37 @@ class CommandLineTests(unittest.TestCase):
                 with self.assertRaises(winfonts.WinfontsError) as raised:
                     winfonts.install_command(args)
         self.assertEqual(raised.exception.code, winfonts.EXIT_VERIFY)
+
+    def test_source_sha256_supports_multiple_mapped_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            first = root / "Windows.iso"
+            second = root / "Office.img"
+            first.write_bytes(b"windows")
+            second.write_bytes(b"office")
+            args = argparse.Namespace(
+                sources=[str(first), str(second)],
+                dest=None,
+                manifest=None,
+                image=None,
+                source_sha256=[
+                    f"{first}={winfonts.sha256_file(first)}",
+                    f"{second}={'0' * 64}",
+                ],
+                duplicate_policy="skip-existing",
+            )
+            with redirect_stderr(io.StringIO()):
+                with self.assertRaises(winfonts.WinfontsError) as raised:
+                    winfonts.install_command(args)
+        self.assertEqual(raised.exception.code, winfonts.EXIT_VERIFY)
+        self.assertIn(str(second), str(raised.exception))
+
+    def test_prefer_source_is_a_deprecated_install_source_alias(self) -> None:
+        parser = winfonts.build_parser()
+        args = parser.parse_args(
+            ["scan", "/tmp/source", "--duplicate-policy", "prefer-source"]
+        )
+        self.assertEqual(args.duplicate_policy, "prefer-source")
 
     def test_disk_image_falls_back_to_archive_extraction(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -190,6 +224,39 @@ class CommandLineTests(unittest.TestCase):
             ):
                 candidates = winfonts.extract_legacy_office_candidates(info, output)
         self.assertEqual([candidate.path for candidate in candidates], [loose.resolve()])
+
+    def test_legacy_office_extracts_nested_cab_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            output = root / "output"
+            output.mkdir()
+            initial = root / "Office.cab"
+            initial.write_bytes(b"outer")
+            info = winfonts.SourceInfo("office-legacy-media", root=root)
+            calls = 0
+
+            def extract(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                nonlocal calls
+                calls += 1
+                archive_out = Path(argv[argv.index("-d") + 1])
+                if calls == 1:
+                    (archive_out / "nested.cab").write_bytes(b"inner")
+                else:
+                    (archive_out / "font.ttf").write_bytes(b"font")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            with (
+                patch(
+                    "winfonts_engine.command_exists",
+                    side_effect=lambda name: name == "cabextract",
+                ),
+                patch("winfonts_engine.subprocess.run", side_effect=extract),
+                redirect_stderr(io.StringIO()),
+            ):
+                candidates = winfonts.extract_legacy_office_candidates(info, output)
+
+        self.assertEqual(calls, 2)
+        self.assertEqual([item.original_filename for item in candidates], ["font.ttf"])
 
 
 if __name__ == "__main__":

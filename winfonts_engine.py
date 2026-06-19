@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import difflib
 import errno
 import fcntl
@@ -12,7 +13,7 @@ import pwd
 import re
 import shlex
 import shutil
-import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,10 +22,10 @@ import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 APP = "winfonts"
-VERSION = "0.6.0"
+VERSION = "0.8.0"
 SCHEMA = 2
 HASH_ALGO = "sha256"
 FONT_EXTS = {".ttf", ".otf", ".ttc", ".otc"}
@@ -156,6 +157,15 @@ def path_under(path: Path, base: Path) -> bool:
         return False
 
 
+def fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def chown_target_if_sudo(path: Path) -> None:
     ctx = target_user_context()
     if not ctx.from_sudo or os.geteuid() != 0:
@@ -253,6 +263,10 @@ def default_state_dir() -> Path:
 
 def default_manifest() -> Path:
     return default_state_dir() / "manifest.jsonl"
+
+
+def pending_journal_path(manifest: Path) -> Path:
+    return manifest.with_name(manifest.name + ".pending.jsonl")
 
 
 def source_default_subdir(info: SourceInfo) -> str:
@@ -415,6 +429,15 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def human_size(value: int) -> str:
+    amount = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if amount < 1024 or unit == "TiB":
+            return f"{int(amount)} B" if unit == "B" else f"{amount:.1f} {unit}"
+        amount /= 1024
+    return f"{value} B"
+
+
 def has_optical_image_signature(path: Path) -> bool:
     try:
         with path.open("rb") as handle:
@@ -526,6 +549,13 @@ class SourcePlan:
     source_sha256: str = ""
 
 
+@dataclass(frozen=True)
+class ArchiveEntry:
+    path: str
+    size: int
+    is_dir: bool
+
+
 def norm(value: str) -> str:
     return " ".join((value or "").casefold().split())
 
@@ -561,7 +591,13 @@ class Lock:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             chown_target_chain_if_sudo(self.path.parent)
-            self.handle = self.path.open("a+")
+            flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(self.path, flags, 0o600)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                os.close(fd)
+                raise WinfontsError(f"lock path is not a regular file: {self.path}", EXIT_IO)
+            self.handle = os.fdopen(fd, "a+")
             chown_target_if_sudo(self.path)
         except OSError as exc:
             raise WinfontsError(f"could not create lock file {self.path}: {exc}", EXIT_IO) from exc
@@ -579,6 +615,10 @@ class Lock:
                 fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
             finally:
                 self.handle.close()
+
+
+def destination_lock_path(dest: Path) -> Path:
+    return dest.parent / f".{dest.name}.winfonts.lock"
 
 
 class TempManager:
@@ -624,18 +664,34 @@ class TempManager:
             )
         extract_dir = tmp / f"archive-{uuid.uuid4().hex}"
         extract_dir.mkdir()
-        log(f"mount unavailable; extracting disk image with {extractor}: {source}")
+        entries = list_archive_entries(extractor, source)
+        selected, selection = select_archive_entries(entries)
+        extraction_size = sum(entry.size for entry in (selected or entries) if not entry.is_dir)
+        required = extraction_size + max(64 * 1024 * 1024, extraction_size // 10)
+        check_space(tmp, required, "disk-image extraction")
+        log(
+            f"mount unavailable; extracting disk image with {extractor} "
+            f"({selection}, {len(selected or entries)} entries, {human_size(extraction_size)}): {source}"
+        )
+        listfile: Path | None = None
+        argv = [
+            extractor,
+            "x",
+            "-y",
+            "-bso0",
+            "-bsp0",
+            "-bse1",
+            f"-o{extract_dir}",
+            str(source),
+        ]
+        if selected:
+            listfile = tmp / f"archive-selection-{uuid.uuid4().hex}.txt"
+            with listfile.open("w", encoding="utf-8", newline="\n") as handle:
+                for entry in selected:
+                    handle.write(entry.path + "\n")
+            argv.extend(["-scsUTF-8", f"@{listfile}"])
         proc = subprocess.run(
-            [
-                extractor,
-                "x",
-                "-y",
-                "-bso0",
-                "-bsp0",
-                "-bse1",
-                f"-o{extract_dir}",
-                str(source),
-            ],
+            argv,
             text=True,
             capture_output=True,
             check=False,
@@ -644,6 +700,7 @@ class TempManager:
             details = (proc.stderr or proc.stdout or "").strip()
             suffix = f": {details}" if details else f" (exit code {proc.returncode})"
             raise WinfontsError(f"could not extract disk image {source}{suffix}", EXIT_IO)
+        validate_extracted_tree(extract_dir)
         return extract_dir
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
@@ -654,6 +711,126 @@ class TempManager:
                 pass
         if self.tempdir is not None:
             self.tempdir.cleanup()
+
+
+def parse_7z_slt(raw: str) -> list[ArchiveEntry]:
+    entries: list[ArchiveEntry] = []
+    fields: dict[str, str] = {}
+    for line in [*raw.splitlines(), ""]:
+        if not line.strip():
+            path = fields.get("Path", "")
+            if path:
+                try:
+                    size = int(fields.get("Size", "0") or 0)
+                except ValueError:
+                    size = 0
+                entries.append(
+                    ArchiveEntry(
+                        path=path,
+                        size=max(0, size),
+                        is_dir=fields.get("Folder", "").strip() == "+",
+                    )
+                )
+            fields = {}
+            continue
+        if " = " in line:
+            key, value = line.split(" = ", 1)
+            fields[key] = value
+    return entries
+
+
+def safe_archive_member(path: str) -> bool:
+    if not path or "\x00" in path or "\n" in path or "\r" in path:
+        return False
+    normalized = path.replace("\\", "/")
+    if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
+        return False
+    return all(part not in {"", ".", ".."} for part in normalized.split("/"))
+
+
+def validate_extracted_tree(root: Path) -> None:
+    resolved_root = root.resolve(strict=True)
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise WinfontsError(f"extracted media contains a symlink: {path}", EXIT_IO)
+        if not path_under(path, resolved_root):
+            raise WinfontsError(f"extracted media path escaped its temporary root: {path}", EXIT_IO)
+
+
+def list_archive_entries(extractor: str, source: Path) -> list[ArchiveEntry]:
+    proc = subprocess.run(
+        [extractor, "l", "-slt", "-ba", str(source)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        details = (proc.stderr or proc.stdout or "").strip()
+        suffix = f": {details}" if details else f" (exit code {proc.returncode})"
+        raise WinfontsError(f"could not inspect disk image {source}{suffix}", EXIT_IO)
+    entries = parse_7z_slt(proc.stdout)
+    if not entries:
+        raise WinfontsError(f"disk image contains no extractable entries: {source}", EXIT_NOT_FOUND)
+    unsafe = [entry.path for entry in entries if not safe_archive_member(entry.path)]
+    if unsafe:
+        raise WinfontsError(
+            f"disk image contains an unsafe archive path: {unsafe[0]}",
+            EXIT_IO,
+        )
+    return entries
+
+
+def select_archive_entries(entries: list[ArchiveEntry]) -> tuple[list[ArchiveEntry], str]:
+    files = [entry for entry in entries if not entry.is_dir]
+
+    def normalized(entry: ArchiveEntry) -> str:
+        return entry.path.replace("\\", "/").lstrip("./").casefold()
+
+    windows_images = [
+        entry
+        for entry in files
+        if re.search(r"(^|/)sources/install\.(wim|esd)$", normalized(entry))
+        or re.search(r"(^|/)sources/install[^/]*\.swm$", normalized(entry))
+    ]
+    if windows_images:
+        return windows_images, "selected Windows image payload"
+
+    office_streams = [
+        entry
+        for entry in files
+        if "/office/data/" in f"/{normalized(entry)}"
+        and Path(normalized(entry)).name.startswith("stream.")
+        and Path(normalized(entry)).name.endswith(".dat")
+    ]
+    loose_fonts = [
+        entry
+        for entry in files
+        if Path(normalized(entry)).suffix in FONT_EXTS
+    ]
+    if office_streams:
+        selected = {entry.path: entry for entry in [*office_streams, *loose_fonts]}
+        return list(selected.values()), "selected Office Click-to-Run payload"
+
+    legacy_payloads = [
+        entry
+        for entry in files
+        if Path(normalized(entry)).suffix in {".cab", ".msi"}
+        or Path(normalized(entry)).name == "setup.exe"
+    ]
+    if legacy_payloads:
+        selected = {entry.path: entry for entry in [*legacy_payloads, *loose_fonts]}
+        return list(selected.values()), "selected legacy Office payload"
+
+    windows_fonts = [
+        entry
+        for entry in loose_fonts
+        if "/windows/fonts/" in f"/{normalized(entry)}"
+    ]
+    if windows_fonts:
+        return windows_fonts, "selected Windows font files"
+    if loose_fonts:
+        return loose_fonts, "selected loose font files"
+    return [], "full image fallback"
 
 
 def detect_source(source: Path, tmp: Path, tm: TempManager) -> SourceInfo:
@@ -921,13 +1098,15 @@ def extract_candidates(
     office_neutral_only: bool,
     office_arch: str,
     office_language: list[str],
+    keep_duplicate_content: bool = False,
 ) -> tuple[list[Candidate], list[str]]:
     notes: list[str] = []
     cand_dir = tmp / "candidates"
     cand_dir.mkdir()
 
     if info.source_type.endswith("windows-image") or info.source_type.endswith("windows-media"):
-        assert info.wim is not None
+        if info.wim is None:
+            raise WinfontsError("internal error: Windows image source has no WIM/ESD path", EXIT_IO)
         selected_image = image if image is not None else 1
         if image is None:
             log("Windows image index: 1 (auto; use --image N only if you want a different Windows edition)")
@@ -949,7 +1128,8 @@ def extract_candidates(
         return candidates_from_directory(cand_dir, info.source_type, str(info.wim), "", selected_image), notes
 
     if info.source_type.endswith("windows-fonts-dir"):
-        assert info.windows_fonts is not None
+        if info.windows_fonts is None:
+            raise WinfontsError("internal error: Windows font source has no Fonts path", EXIT_IO)
         return candidates_from_directory(
             info.windows_fonts,
             info.source_type,
@@ -984,6 +1164,8 @@ def extract_candidates(
             argv.append("--neutral-only")
         for lang in office_language:
             argv.extend(["--language", lang])
+        if keep_duplicate_content:
+            argv.append("--keep-duplicates")
         proc = subprocess.run(argv, text=True, stdout=subprocess.PIPE)
         if proc.returncode == 130:
             raise WinfontsError("Office extraction interrupted", EXIT_INTERRUPTED)
@@ -993,7 +1175,10 @@ def extract_candidates(
             raise WinfontsError("Office extraction produced no font candidates", EXIT_NO_FONTS)
         if proc.returncode != 0:
             raise WinfontsError(f"Office extraction failed with exit code {proc.returncode}", proc.returncode)
-        return candidates_from_office_records(records), notes
+        return candidates_from_office_records(
+            records,
+            keep_duplicate_content=keep_duplicate_content,
+        ), notes
 
     if info.source_type.endswith("office-legacy-media"):
         return extract_legacy_office_candidates(info, cand_dir), notes
@@ -1017,12 +1202,13 @@ def extract_legacy_office_candidates(info: SourceInfo, output: Path) -> list[Can
         (path for path in info.root.rglob("*") if path.is_file() and path.suffix.casefold() == ".msi"),
         key=lambda item: str(item).casefold(),
     )
-    available: list[str] = []
-    if cab_files and command_exists("cabextract"):
-        available.append("cabextract")
-    if msi_files and command_exists("msiextract"):
-        available.append("msiextract")
-    if not available:
+    has_cabextract = command_exists("cabextract")
+    has_msiextract = command_exists("msiextract")
+    can_process_archives = bool(
+        (cab_files and has_cabextract)
+        or (msi_files and has_msiextract)
+    )
+    if not can_process_archives:
         if loose_candidates:
             log(
                 "legacy Office extraction: "
@@ -1041,39 +1227,66 @@ def extract_legacy_office_candidates(info: SourceInfo, output: Path) -> list[Can
             EXIT_USAGE,
         )
 
-    failures = 0
-    extracted_archives = 0
-    for index, path in enumerate(cab_files, start=1):
-        if not command_exists("cabextract"):
-            continue
-        archive_out = output / f"cab-{index}"
-        archive_out.mkdir()
-        proc = subprocess.run(
-            ["cabextract", "-q", "-d", str(archive_out), str(path)],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if proc.returncode == 0:
-            extracted_archives += 1
-        else:
-            failures += 1
+    if cab_files and not has_cabextract:
+        log(f"legacy Office extraction: skipping {len(cab_files)} CAB file(s); cabextract is missing")
+    if msi_files and not has_msiextract:
+        log(f"legacy Office extraction: skipping {len(msi_files)} MSI file(s); msiextract is missing")
 
-    for index, path in enumerate(msi_files, start=1):
-        if not command_exists("msiextract"):
+    queue: list[Path] = [*cab_files, *msi_files]
+    seen_payload_hashes: set[str] = set()
+    failures: list[str] = []
+    extracted_archives = 0
+    processed = 0
+    while queue:
+        path = queue.pop(0)
+        suffix = path.suffix.casefold()
+        if suffix == ".cab" and not has_cabextract:
             continue
-        archive_out = output / f"msi-{index}"
+        if suffix == ".msi" and not has_msiextract:
+            continue
+        try:
+            payload_hash = sha256_file(path)
+        except OSError as exc:
+            failures.append(f"{path}: unreadable ({exc})")
+            continue
+        if payload_hash in seen_payload_hashes:
+            continue
+        seen_payload_hashes.add(payload_hash)
+        processed += 1
+        if processed > 10000:
+            raise WinfontsError("legacy Office payload recursion limit exceeded", EXIT_IO)
+
+        archive_out = output / f"payload-{processed:05d}-{suffix.lstrip('.')}"
         archive_out.mkdir()
+        argv = (
+            ["cabextract", "-q", "-d", str(archive_out), str(path)]
+            if suffix == ".cab"
+            else ["msiextract", "-C", str(archive_out), str(path)]
+        )
         proc = subprocess.run(
-            ["msiextract", "-C", str(archive_out), str(path)],
+            argv,
             text=True,
             capture_output=True,
             check=False,
         )
         if proc.returncode == 0:
             extracted_archives += 1
+            nested = sorted(
+                (
+                    nested
+                    for nested in archive_out.rglob("*")
+                    if nested.is_file() and nested.suffix.casefold() in {".cab", ".msi"}
+                ),
+                key=lambda item: str(item).casefold(),
+            )
+            queue.extend(nested)
         else:
-            failures += 1
+            details = " ".join((proc.stderr or proc.stdout or "").split())
+            failure = f"{path} (exit {proc.returncode})"
+            if details:
+                failure += f": {details[:500]}"
+            failures.append(failure)
+            log(f"legacy Office extraction failed: {failure}")
 
     archive_candidates = candidates_from_directory(
         output,
@@ -1085,7 +1298,7 @@ def extract_legacy_office_candidates(info: SourceInfo, output: Path) -> list[Can
     candidates = loose_candidates + archive_candidates
     log(
         "legacy Office extraction: "
-        f"archives={extracted_archives}, failures={failures}, "
+        f"archives={extracted_archives}, failures={len(failures)}, "
         f"loose={len(loose_candidates)}, extracted={len(archive_candidates)}"
     )
     if not candidates:
@@ -1099,6 +1312,8 @@ def extract_legacy_office_candidates(info: SourceInfo, output: Path) -> list[Can
 def candidates_from_directory(root: Path, source_type: str, source_path: str, stream: str, image: int | None) -> list[Candidate]:
     result: list[Candidate] = []
     for path in sorted(root.rglob("*"), key=lambda item: str(item).casefold()):
+        if path.is_symlink():
+            continue
         if path.is_file() and path.suffix.casefold() in FONT_EXTS:
             result.append(
                 Candidate(
@@ -1113,7 +1328,11 @@ def candidates_from_directory(root: Path, source_type: str, source_path: str, st
     return result
 
 
-def candidates_from_office_records(records: Path) -> list[Candidate]:
+def candidates_from_office_records(
+    records: Path,
+    *,
+    keep_duplicate_content: bool = False,
+) -> list[Candidate]:
     result: list[Candidate] = []
     seen: set[str] = set()
     with records.open("r", encoding="utf-8") as handle:
@@ -1127,7 +1346,7 @@ def candidates_from_office_records(records: Path) -> list[Candidate]:
             if record.get("record") != "candidate":
                 continue
             digest = str(record.get("sha256", ""))
-            if digest in seen:
+            if digest in seen and not keep_duplicate_content:
                 continue
             seen.add(digest)
             path = Path(str(record["output_path"]))
@@ -1151,9 +1370,17 @@ def validate_wim_image(wim: Path, image: int) -> None:
         raise WinfontsError(f"WIM image index {image} is not available in {wim}", EXIT_USAGE)
 
 
-def build_candidate_metadata(candidates: list[Candidate]) -> None:
+def build_candidate_metadata(
+    candidates: list[Candidate],
+    *,
+    keep_duplicate_content: bool = False,
+) -> None:
     seen_hashes: dict[str, Candidate] = {}
     for cand in candidates:
+        if cand.path.is_symlink():
+            cand.state = "invalid"
+            cand.reason = "source-symlink"
+            continue
         try:
             stat = cand.path.stat()
         except OSError as exc:
@@ -1171,7 +1398,7 @@ def build_candidate_metadata(candidates: list[Candidate]) -> None:
             continue
         if not cand.sha256:
             cand.sha256 = sha256_file(cand.path)
-        if cand.sha256 in seen_hashes:
+        if cand.sha256 in seen_hashes and not keep_duplicate_content:
             cand.state = "skip"
             first = seen_hashes[cand.sha256]
             cand.reason = (
@@ -1258,7 +1485,7 @@ def decide_candidates(
             counters[cand.reason or cand.state] = counters.get(cand.reason or cand.state, 0) + 1
             continue
 
-        if cand.sha256 in content_seen:
+        if cand.sha256 in content_seen and duplicate_policy != "keep-all":
             cand.state = "skip"
             cand.reason = "duplicate-content-in-run"
             counters[cand.reason] = counters.get(cand.reason, 0) + 1
@@ -1346,7 +1573,11 @@ def add_candidate_to_indexes(
         face_index.setdefault(face.face_key(), []).append(face)
 
 
-def read_manifest(path: Path) -> list[dict[str, Any]]:
+def read_manifest(
+    path: Path,
+    *,
+    allow_duplicate_dest: bool = False,
+) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     records: list[dict[str, Any]] = []
@@ -1363,8 +1594,12 @@ def read_manifest(path: Path) -> list[dict[str, Any]]:
                 raise WinfontsError(f"unsupported manifest schema at line {line_no}", EXIT_USAGE)
             if record.get("record") == "font_file":
                 dest = str(record.get("dest_path", ""))
-                if dest in seen_dest:
-                    raise WinfontsError(f"duplicate manifest record for {dest}", EXIT_USAGE)
+                if dest in seen_dest and not allow_duplicate_dest:
+                    raise WinfontsError(
+                        f"duplicate manifest record for {dest}; run "
+                        f"'{display_prog()} repair --compact'",
+                        EXIT_USAGE,
+                    )
                 seen_dest.add(dest)
             records.append(record)
     return records
@@ -1382,6 +1617,7 @@ def write_manifest_atomic(path: Path, records: list[dict[str, Any]]) -> None:
             os.fsync(handle.fileno())
         os.replace(tmp_name, path)
         chown_target_if_sudo(path)
+        fsync_directory(path.parent)
     except Exception:
         try:
             os.unlink(tmp_name)
@@ -1390,8 +1626,17 @@ def write_manifest_atomic(path: Path, records: list[dict[str, Any]]) -> None:
         raise
 
 
+def unlink_durable(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    fsync_directory(path.parent)
+
+
 def install_candidate(cand: Candidate, dest: Path) -> dict[str, Any]:
-    assert cand.target is not None
+    if cand.target is None:
+        raise WinfontsError("internal error: install candidate has no target path", EXIT_IO)
     target = cand.target
     check_space(dest, cand.size * 2 + 4096, "font installation")
     tmp = dest / f".{target.name}.tmp.{os.getpid()}"
@@ -1408,8 +1653,21 @@ def install_candidate(cand: Candidate, dest: Path) -> dict[str, Any]:
         copied_faces = fc_scan(tmp)
         if not copied_faces:
             raise WinfontsError(f"copied font failed validation: {cand.original_filename}", EXIT_IO)
-        os.replace(tmp, target)
+        with tmp.open("rb") as handle:
+            os.fsync(handle.fileno())
+        try:
+            os.link(tmp, target, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise WinfontsError(
+                f"target changed during install; refusing to overwrite: {target}",
+                EXIT_IO,
+            ) from exc
+        fsync_directory(dest)
+        tmp.unlink()
         chown_target_if_sudo(target)
+        with target.open("rb") as handle:
+            os.fsync(handle.fileno())
+        fsync_directory(dest)
         return {
             "schema": SCHEMA,
             "record": "font_file",
@@ -1442,17 +1700,33 @@ def install_candidate(cand: Candidate, dest: Path) -> dict[str, Any]:
             pass
 
 
-def rollback_files(records: list[dict[str, Any]]) -> None:
+def rollback_files(records: list[dict[str, Any]]) -> list[str]:
+    failures: list[str] = []
     for record in reversed(records):
         path = Path(str(record.get("dest_path", "")))
         try:
-            if path.exists() and not path.is_symlink() and sha256_file(path) == record.get("sha256"):
-                path.unlink()
-        except OSError:
-            pass
+            if path.is_symlink():
+                failures.append(f"{path}: refused symlink")
+                continue
+            if not path.exists():
+                continue
+            if not path.is_file():
+                failures.append(f"{path}: not a regular file")
+                continue
+            if sha256_file(path) != record.get("sha256"):
+                failures.append(f"{path}: content changed")
+                continue
+            path.unlink()
+            fsync_directory(path.parent)
+        except OSError as exc:
+            failures.append(f"{path}: {exc}")
+    return failures
 
 
 def install_command(args: argparse.Namespace) -> int:
+    if getattr(args, "duplicate_policy", "skip-existing") == "prefer-source":
+        log("warning: duplicate policy 'prefer-source' is deprecated; using 'install-source'")
+        args.duplicate_policy = "install-source"
     sources = [canonical_existing(Path(item), "source") for item in args.sources]
     if args.dest is not None:
         reject_bad_path_text(args.dest, "--dest")
@@ -1461,21 +1735,57 @@ def install_command(args: argparse.Namespace) -> int:
     if args.image is not None and args.image <= 0:
         raise WinfontsError("--image must be a positive integer", EXIT_USAGE)
     source_hashes: dict[Path, str] = {}
-    source_sha256 = getattr(args, "source_sha256", None)
-    if source_sha256 is not None:
-        if len(sources) != 1:
-            raise WinfontsError("--source-sha256 requires exactly one source", EXIT_USAGE)
-        if not sources[0].is_file():
-            raise WinfontsError("--source-sha256 can only verify a regular source file", EXIT_USAGE)
-        log(f"verifying source SHA-256: {sources[0]}")
-        actual = sha256_file(sources[0])
-        if actual != source_sha256:
+    raw_hash_specs = getattr(args, "source_sha256", None) or []
+    if isinstance(raw_hash_specs, str):
+        raw_hash_specs = [raw_hash_specs]
+    for spec in raw_hash_specs:
+        if "=" in spec:
+            raw_source, expected = spec.rsplit("=", 1)
+            source = canonical_existing(Path(raw_source), "--source-sha256 source")
+            if source not in sources:
+                raise WinfontsError(
+                    f"--source-sha256 source is not among the requested sources: {source}",
+                    EXIT_USAGE,
+                )
+        else:
+            if len(sources) != 1:
+                raise WinfontsError(
+                    "a bare --source-sha256 HASH requires exactly one source; "
+                    "use --source-sha256 SOURCE=HASH for multiple sources",
+                    EXIT_USAGE,
+                )
+            source = sources[0]
+            expected = spec
+        if not source.is_file():
             raise WinfontsError(
-                f"source SHA-256 mismatch: expected {source_sha256}, got {actual}",
+                f"--source-sha256 can only verify a regular source file: {source}",
+                EXIT_USAGE,
+            )
+        if source in source_hashes:
+            raise WinfontsError(f"duplicate --source-sha256 entry for {source}", EXIT_USAGE)
+        log(f"verifying source SHA-256: {source}")
+        actual = sha256_file(source)
+        if actual != expected:
+            raise WinfontsError(
+                f"source SHA-256 mismatch for {source}: expected {expected}, got {actual}",
                 EXIT_VERIFY,
             )
-        source_hashes[sources[0]] = actual
+        source_hashes[source] = actual
         log(f"source SHA-256 verified: {actual}")
+
+    manifest_arg = Path(args.manifest) if args.manifest is not None else default_manifest()
+    preflight_manifest = canonical_future_path(manifest_arg, "manifest")
+    preflight_journal = pending_journal_path(preflight_manifest)
+    if not args.dry_run and (preflight_manifest.exists() or preflight_journal.exists()):
+        with Lock(preflight_manifest.parent / ".lock"):
+            if preflight_journal.exists():
+                raise WinfontsError(
+                    f"pending installation journal found: {preflight_journal}; run "
+                    f"'{display_prog()} repair --recover-pending'",
+                    EXIT_PARTIAL,
+                )
+            preflight_records = read_manifest(preflight_manifest)
+            validate_install_manifest(preflight_records)
 
     tm = TempManager()
     with tm as tmp:
@@ -1504,17 +1814,38 @@ def install_command(args: argparse.Namespace) -> int:
                 )
             )
 
-        manifest_arg = Path(args.manifest) if args.manifest is not None else default_manifest()
         if args.dry_run:
             manifest = canonical_future_path(manifest_arg, "manifest")
         else:
             manifest = canonical_for_create(manifest_arg, "manifest", create_parent=True)
 
-        with Lock(manifest.parent / ".lock"):
-            old_records = read_manifest(manifest)
-            if has_incomplete_transaction(old_records):
-                raise WinfontsError("previous installation transaction is incomplete; run status/verify before installing again", EXIT_PARTIAL)
-            return _install_with_temp(plans, tmp, manifest, old_records, args)
+        with ExitStack() as stack:
+            stack.enter_context(Lock(manifest.parent / ".lock"))
+            journal = pending_journal_path(manifest)
+            if journal.exists():
+                raise WinfontsError(
+                    f"pending installation journal found: {journal}; run "
+                    f"'{display_prog()} repair --recover-pending'",
+                    EXIT_PARTIAL,
+                )
+            if not args.dry_run:
+                lock_paths = sorted(
+                    {destination_lock_path(plan.dest) for plan in plans},
+                    key=lambda item: str(item),
+                )
+                for lock_path in lock_paths:
+                    stack.enter_context(Lock(lock_path))
+            if args.dry_run:
+                verified_records: list[dict[str, Any]] = []
+            else:
+                verified_records = validate_install_manifest(read_manifest(manifest))
+            return _install_with_temp(
+                plans,
+                tmp,
+                manifest,
+                verified_records,
+                args,
+            )
 
 
 def validate_source_options(args: argparse.Namespace, infos: list[SourceInfo]) -> None:
@@ -1540,6 +1871,9 @@ def _install_with_temp(
 ) -> int:
     transaction_id = uuid.uuid4().hex
     installed_records: list[dict[str, Any]] = []
+    planned_rollback: list[dict[str, Any]] = []
+    journal = pending_journal_path(manifest)
+    journal_written = False
     try:
         candidates: list[Candidate] = []
         for index, plan in enumerate(plans, start=1):
@@ -1555,6 +1889,7 @@ def _install_with_temp(
                 args.office_neutral_only,
                 args.office_arch,
                 args.office_language or [],
+                args.duplicate_policy == "keep-all",
             )
             for candidate in source_candidates:
                 candidate.install_dir = plan.dest
@@ -1567,7 +1902,10 @@ def _install_with_temp(
         if not candidates:
             raise WinfontsError("no font candidates found", EXIT_NO_FONTS)
         log(f"candidate files total: {len(candidates)}")
-        build_candidate_metadata(candidates)
+        build_candidate_metadata(
+            candidates,
+            keep_duplicate_content=args.duplicate_policy == "keep-all",
+        )
         fallback_dest = plans[0].dest
         counters = decide_candidates(candidates, fallback_dest, args.duplicate_policy)
         installable = [candidate for candidate in candidates if candidate.state == "install"]
@@ -1585,6 +1923,13 @@ def _install_with_temp(
             out(f"Manifest: {manifest}")
             return EXIT_DUPLICATES if not installable else EXIT_OK
 
+        if not installable:
+            out("Installed: 0")
+            out(f"Skipped/invalid: {len(candidates)}")
+            print_destinations(destinations)
+            out(f"Manifest unchanged: {manifest}")
+            return EXIT_DUPLICATES
+
         size_by_dest: dict[Path, int] = {}
         count_by_dest: dict[Path, int] = {}
         for candidate in installable:
@@ -1595,6 +1940,30 @@ def _install_with_temp(
             dest.mkdir(parents=True, exist_ok=True)
             chown_target_chain_if_sudo(dest)
             check_space(dest, size_by_dest[dest] + 4096 * max(1, count_by_dest[dest]), "font installation")
+        for candidate in installable:
+            if candidate.target is None:
+                raise WinfontsError("internal error: planned candidate has no target", EXIT_IO)
+            planned_rollback.append(
+                {
+                    "dest_path": str(candidate.target),
+                    "install_dir": str(candidate_dest(candidate, fallback_dest)),
+                    "sha256": candidate.sha256,
+                }
+            )
+        write_manifest_atomic(
+            journal,
+            [
+                {
+                    "schema": SCHEMA,
+                    "record": "pending_install",
+                    "transaction_id": transaction_id,
+                    "time": now_iso(),
+                    "manifest": str(manifest),
+                    "planned_files": planned_rollback,
+                }
+            ],
+        )
+        journal_written = True
         manifest_records = old_records + [
             {
                 "schema": SCHEMA,
@@ -1634,8 +2003,13 @@ def _install_with_temp(
         )
         try:
             write_manifest_atomic(manifest, manifest_records)
-        except Exception:
-            rollback_files(installed_records)
+        except Exception as exc:
+            rollback_failures = rollback_files(planned_rollback)
+            planned_rollback.clear()
+            installed_records.clear()
+            if journal_written and not rollback_failures:
+                unlink_durable(journal)
+                journal_written = False
             aborted = old_records + [
                 {
                     "schema": SCHEMA,
@@ -1644,13 +2018,30 @@ def _install_with_temp(
                     "state": "aborted",
                     "time": now_iso(),
                     "reason": "manifest-write-failed",
+                    "rollback_failures": rollback_failures,
                 }
             ]
             try:
                 write_manifest_atomic(manifest, aborted)
-            except Exception:
-                pass
-                raise
+            except Exception as abort_exc:
+                log(f"could not record aborted transaction: {abort_exc}")
+            if rollback_failures:
+                details = "; ".join(rollback_failures)
+                raise WinfontsError(
+                    f"manifest write failed and rollback was incomplete: {exc}; {details}",
+                    EXIT_PARTIAL,
+                ) from exc
+            raise WinfontsError(
+                f"manifest write failed; installation rolled back: {exc}",
+                EXIT_IO,
+            ) from exc
+        planned_rollback.clear()
+        if journal_written:
+            try:
+                unlink_durable(journal)
+                journal_written = False
+            except OSError as exc:
+                log(f"warning: installation committed but pending journal could not be removed: {exc}")
         for dest in destinations:
             run(["fc-cache", "-f", "--", str(dest)], capture=True, check=False, as_target_user=True)
         out(f"Installed: {len(installed_records)}")
@@ -1660,7 +2051,16 @@ def _install_with_temp(
         out(f"Rollback: ./winfonts uninstall --manifest {manifest}")
         return EXIT_DUPLICATES if not installed_records else EXIT_OK
     except Exception:
-        rollback_files(installed_records)
+        if planned_rollback:
+            failures = rollback_files(planned_rollback)
+            for failure in failures:
+                log(f"rollback warning: {failure}")
+            if journal_written and not failures:
+                try:
+                    unlink_durable(journal)
+                    journal_written = False
+                except OSError as exc:
+                    log(f"rollback warning: could not remove pending journal: {exc}")
         raise
 
 
@@ -1672,8 +2072,9 @@ def has_incomplete_transaction(records: list[dict[str, Any]]) -> bool:
     return any(state == "started" for state in states.values())
 
 
-def verify_records(manifest: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    records = read_manifest(manifest)
+def verify_manifest_records(
+    records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
     counters = {"ok": 0, "missing": 0, "modified": 0, "malformed": 0, "symlink": 0}
     for record in records:
         if record.get("record") != "font_file":
@@ -1704,11 +2105,48 @@ def verify_records(manifest: Path) -> tuple[list[dict[str, Any]], dict[str, int]
     return records, counters
 
 
+def verify_records(manifest: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    return verify_manifest_records(read_manifest(manifest))
+
+
+def clean_runtime_fields(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {key: value for key, value in record.items() if not key.startswith("_")}
+        for record in records
+    ]
+
+
+def validate_install_manifest(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if has_incomplete_transaction(records):
+        raise WinfontsError(
+            "previous installation transaction is incomplete; "
+            f"run '{display_prog()} repair --dry-run'",
+            EXIT_PARTIAL,
+        )
+    verified_records, counters = verify_manifest_records(records)
+    if verification_failed(counters):
+        summary = ", ".join(
+            f"{key}={counters[key]}"
+            for key in ("missing", "modified", "symlink", "malformed")
+            if counters[key]
+        )
+        raise WinfontsError(
+            f"manifest is not clean ({summary}); run "
+            f"'{display_prog()} repair --dry-run' before installing",
+            EXIT_VERIFY,
+        )
+    return clean_runtime_fields(verified_records)
+
+
 def status_command(args: argparse.Namespace) -> int:
     if args.manifest is not None:
         reject_bad_path_text(args.manifest, "--manifest")
     manifest_arg = Path(args.manifest) if args.manifest is not None else default_manifest()
     manifest = canonical_future_path(manifest_arg, "manifest")
+    journal = pending_journal_path(manifest)
+    pending = journal.exists()
     if not manifest.exists():
         if getattr(args, "json", False):
             out(
@@ -1716,6 +2154,7 @@ def status_command(args: argparse.Namespace) -> int:
                     {
                         "manifest": str(manifest),
                         "exists": False,
+                        "pending_journal": str(journal) if pending else None,
                         "status": {
                             "ok": 0,
                             "missing": 0,
@@ -1730,7 +2169,9 @@ def status_command(args: argparse.Namespace) -> int:
             )
         else:
             out(f"No manifest found: {manifest}")
-        return EXIT_OK
+            if pending:
+                out(f"Pending installation journal: {journal}")
+        return EXIT_PARTIAL if pending else EXIT_OK
     with Lock(manifest.parent / ".lock"):
         _records, counters = verify_records(manifest)
     if getattr(args, "json", False):
@@ -1739,16 +2180,22 @@ def status_command(args: argparse.Namespace) -> int:
                 {
                     "manifest": str(manifest),
                     "exists": True,
+                    "pending_journal": str(journal) if pending else None,
                     "status": counters,
                 },
                 indent=2,
                 sort_keys=True,
             )
         )
+        if pending:
+            return EXIT_PARTIAL
         return EXIT_VERIFY if verification_failed(counters) else EXIT_OK
     out(f"Manifest: {manifest}")
     for key in ("ok", "missing", "modified", "symlink", "malformed"):
         out(f"{key}: {counters[key]}")
+    if pending:
+        out(f"pending journal: {journal}")
+        return EXIT_PARTIAL
     return EXIT_VERIFY if verification_failed(counters) else EXIT_OK
 
 
@@ -1770,6 +2217,232 @@ def record_display_name(record: dict[str, Any]) -> str:
 
 def verification_failed(counters: dict[str, int]) -> bool:
     return any(counters.get(key, 0) for key in ("missing", "modified", "symlink", "malformed"))
+
+
+def duplicate_manifest_destinations(records: list[dict[str, Any]]) -> set[str]:
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for record in records:
+        if record.get("record") != "font_file":
+            continue
+        dest = str(record.get("dest_path", ""))
+        if dest in seen:
+            duplicates.add(dest)
+        seen.add(dest)
+    return duplicates
+
+
+def compact_manifest_records(
+    records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int, int]:
+    groups: dict[str, list[int]] = {}
+    for index, record in enumerate(records):
+        if record.get("record") == "font_file":
+            groups.setdefault(str(record.get("dest_path", "")), []).append(index)
+
+    keep_font_indexes: set[int] = set()
+    duplicate_records_removed = 0
+    for indexes in groups.values():
+        ok_indexes = [
+            index for index in indexes if records[index].get("_status") == "ok"
+        ]
+        winner = (ok_indexes or indexes)[-1]
+        keep_font_indexes.add(winner)
+        duplicate_records_removed += len(indexes) - 1
+
+    referenced_transactions = {
+        str(records[index].get("transaction_id", ""))
+        for index in keep_font_indexes
+        if records[index].get("transaction_id")
+    }
+    compacted: list[dict[str, Any]] = []
+    transactions_removed = 0
+    for index, record in enumerate(records):
+        kind = record.get("record")
+        if kind == "font_file" and index not in keep_font_indexes:
+            continue
+        if kind == "transaction":
+            transaction_id = str(record.get("transaction_id", ""))
+            if not transaction_id or transaction_id not in referenced_transactions:
+                transactions_removed += 1
+                continue
+        compacted.append(record)
+    return compacted, duplicate_records_removed, transactions_removed
+
+
+def repair_command(args: argparse.Namespace) -> int:
+    if args.manifest is not None:
+        reject_bad_path_text(args.manifest, "--manifest")
+    manifest_arg = Path(args.manifest) if args.manifest is not None else default_manifest()
+    manifest = canonical_future_path(manifest_arg, "manifest")
+    journal = pending_journal_path(manifest)
+    if not manifest.exists() and not journal.exists():
+        raise WinfontsError(f"manifest not found: {manifest}", EXIT_NOT_FOUND)
+
+    requested_statuses = {
+        status
+        for status, enabled in (
+            ("missing", args.drop_missing),
+            ("modified", args.drop_modified),
+            ("symlink", args.drop_symlink),
+            ("malformed", args.drop_malformed),
+        )
+        if enabled
+    }
+    compact = args.compact
+    recover_pending = getattr(args, "recover_pending", False)
+    if args.dry_run and not requested_statuses and not compact:
+        requested_statuses = {"missing", "modified", "symlink", "malformed"}
+        compact = True
+        recover_pending = journal.exists()
+    if not args.dry_run and not requested_statuses and not compact and not recover_pending:
+        raise WinfontsError(
+            "repair requires at least one action; use --dry-run to preview, "
+            "or select --drop-missing/--drop-modified/--drop-symlink/"
+            "--drop-malformed/--compact/--recover-pending",
+            EXIT_USAGE,
+        )
+
+    with Lock(manifest.parent / ".lock"):
+        records = (
+            read_manifest(manifest, allow_duplicate_dest=True)
+            if manifest.exists()
+            else []
+        )
+        verified, counters = verify_manifest_records(records)
+        pending_plans: list[dict[str, Any]] = []
+        if journal.exists():
+            journal_records = read_manifest(journal, allow_duplicate_dest=True)
+            for record in journal_records:
+                if record.get("record") != "pending_install":
+                    continue
+                plans = record.get("planned_files")
+                if isinstance(plans, list):
+                    pending_plans.extend(
+                        plan for plan in plans if isinstance(plan, dict)
+                    )
+        if recover_pending and journal.exists() and not pending_plans:
+            raise WinfontsError(
+                f"pending installation journal is malformed: {journal}",
+                EXIT_USAGE,
+            )
+
+        pending_removed = 0
+        pending_committed = 0
+        pending_blocked: list[str] = []
+        if recover_pending and pending_plans:
+            committed = {
+                (
+                    str(record.get("dest_path", "")),
+                    str(record.get("sha256", "")),
+                )
+                for record in verified
+                if record.get("record") == "font_file"
+            }
+            install_dirs = sorted(
+                {
+                    Path(str(plan.get("install_dir", ""))).resolve(strict=False)
+                    for plan in pending_plans
+                    if str(plan.get("install_dir", ""))
+                },
+                key=lambda item: str(item),
+            )
+            with ExitStack() as stack:
+                for install_dir in install_dirs:
+                    stack.enter_context(Lock(destination_lock_path(install_dir)))
+                for plan in pending_plans:
+                    path = Path(str(plan.get("dest_path", "")))
+                    raw_install_dir = Path(str(plan.get("install_dir", "")))
+                    digest = str(plan.get("sha256", ""))
+                    if (
+                        not path.is_absolute()
+                        or not raw_install_dir.is_absolute()
+                        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                    ):
+                        pending_blocked.append(f"{path}: malformed pending record")
+                        continue
+                    install_dir = raw_install_dir.resolve(strict=False)
+                    if (str(path), digest) in committed:
+                        pending_committed += 1
+                        continue
+                    resolved = path.resolve(strict=False)
+                    if resolved == install_dir or not path_under(resolved, install_dir):
+                        pending_blocked.append(f"{path}: path escaped install directory")
+                        continue
+                    if path.is_symlink():
+                        pending_blocked.append(f"{path}: refused symlink")
+                        continue
+                    if not path.exists():
+                        continue
+                    if not path.is_file():
+                        pending_blocked.append(f"{path}: not a regular file")
+                        continue
+                    try:
+                        if sha256_file(path) != digest:
+                            pending_blocked.append(f"{path}: content changed")
+                            continue
+                        if not args.dry_run:
+                            path.unlink()
+                            fsync_directory(path.parent)
+                        pending_removed += 1
+                    except OSError as exc:
+                        pending_blocked.append(f"{path}: {exc}")
+            if not args.dry_run and not pending_blocked:
+                unlink_durable(journal)
+
+        repaired: list[dict[str, Any]] = []
+        dropped_by_status = {status: 0 for status in requested_statuses}
+        for record in verified:
+            status = str(record.get("_status", ""))
+            if record.get("record") == "font_file" and status in requested_statuses:
+                dropped_by_status[status] += 1
+                continue
+            repaired.append(record)
+
+        duplicate_records_removed = 0
+        transactions_removed = 0
+        if compact:
+            repaired, duplicate_records_removed, transactions_removed = compact_manifest_records(
+                repaired
+            )
+
+        remaining_duplicates = duplicate_manifest_destinations(repaired)
+        if remaining_duplicates and not args.dry_run:
+            raise WinfontsError(
+                "duplicate destination records remain; rerun repair with --compact",
+                EXIT_USAGE,
+            )
+
+        changed = (
+            any(dropped_by_status.values())
+            or duplicate_records_removed > 0
+            or transactions_removed > 0
+        )
+        action = "Would repair" if args.dry_run else "Repaired"
+        out(f"Manifest: {manifest}")
+        for status in ("missing", "modified", "symlink", "malformed"):
+            out(f"{action} {status}: {dropped_by_status.get(status, 0)}")
+        out(f"{action} duplicate records: {duplicate_records_removed}")
+        out(f"{action} empty transaction records: {transactions_removed}")
+        out(f"{action} pending files: {pending_removed}")
+        out(f"Pending files already committed: {pending_committed}")
+        out(f"Pending files blocked: {len(pending_blocked)}")
+        for failure in pending_blocked:
+            out(f"  blocked: {failure}")
+        if args.dry_run:
+            out(f"Current verification failures: {sum(counters[key] for key in counters if key != 'ok')}")
+            return EXIT_OK
+        if not changed:
+            out("Manifest unchanged.")
+            return EXIT_PARTIAL if pending_blocked else EXIT_OK
+
+        clean = clean_runtime_fields(repaired)
+        if clean:
+            write_manifest_atomic(manifest, clean)
+        else:
+            unlink_durable(manifest)
+        out("Manifest repair complete.")
+        return EXIT_PARTIAL if pending_blocked else EXIT_OK
 
 
 def list_command(args: argparse.Namespace) -> int:
@@ -1851,63 +2524,87 @@ def uninstall_command(args: argparse.Namespace) -> int:
         raise WinfontsError(f"manifest not found: {manifest}", EXIT_NOT_FOUND)
     with Lock(manifest.parent / ".lock"):
         records, counters = verify_records(manifest)
-        remaining: list[dict[str, Any]] = []
-        removed = 0
-        blocked = 0
-        for record in records:
-            if record.get("record") != "font_file":
-                remaining.append(record)
-                continue
-            status = record.get("_status")
-            path = Path(str(record.get("dest_path", "")))
-            install_dir = Path(str(record.get("install_dir", ""))).resolve(strict=False)
-            resolved = path.resolve(strict=False)
-            if not str(resolved).startswith(str(install_dir) + os.sep):
-                record["_uninstall_status"] = "path-escape"
-                remaining.append(record)
-                blocked += 1
-                continue
-            if not record.get("newly_created", False):
-                record["_uninstall_status"] = "not-created-by-transaction"
-                remaining.append(record)
-                blocked += 1
-                continue
-            if status != "ok":
-                record["_uninstall_status"] = status
-                remaining.append(record)
-                blocked += 1
-                continue
-            if args.dry_run:
-                out(f"would remove: {path}")
-                remaining.append(record)
-                continue
-            try:
-                path.unlink()
-                removed += 1
-            except OSError as exc:
-                record["_uninstall_status"] = f"remove-failed:{exc.errno}"
-                remaining.append(record)
-                blocked += 1
+        install_dirs = sorted(
+            {
+                Path(str(record.get("install_dir", ""))).resolve(strict=False)
+                for record in records
+                if record.get("record") == "font_file"
+                and str(record.get("install_dir", ""))
+            },
+            key=lambda item: str(item),
+        )
+        with ExitStack() as stack:
+            for install_dir in install_dirs:
+                stack.enter_context(Lock(destination_lock_path(install_dir)))
+            return _uninstall_locked(args, manifest, records, counters)
+
+
+def _uninstall_locked(
+    args: argparse.Namespace,
+    manifest: Path,
+    records: list[dict[str, Any]],
+    _counters: dict[str, int],
+) -> int:
+    remaining: list[dict[str, Any]] = []
+    removed = 0
+    blocked = 0
+    removable = 0
+    for record in records:
+        if record.get("record") != "font_file":
+            remaining.append(record)
+            continue
+        status = record.get("_status")
+        path = Path(str(record.get("dest_path", "")))
+        install_dir = Path(str(record.get("install_dir", ""))).resolve(strict=False)
+        resolved = path.resolve(strict=False)
+        if resolved == install_dir or not path_under(resolved, install_dir):
+            record["_uninstall_status"] = "path-escape"
+            remaining.append(record)
+            blocked += 1
+            continue
+        if not record.get("newly_created", False):
+            record["_uninstall_status"] = "not-created-by-transaction"
+            remaining.append(record)
+            blocked += 1
+            continue
+        if status != "ok":
+            record["_uninstall_status"] = status
+            remaining.append(record)
+            blocked += 1
+            continue
+        removable += 1
         if args.dry_run:
-            out(f"Would remove: {sum(1 for r in records if r.get('record') == 'font_file' and r.get('_status') == 'ok')}")
-            return EXIT_OK
-        font_records_left = [r for r in remaining if r.get("record") == "font_file"]
-        if font_records_left:
-            clean = [{k: v for k, v in r.items() if not k.startswith("_")} for r in remaining]
-            write_manifest_atomic(manifest, clean)
-        else:
-            try:
-                manifest.unlink()
-            except FileNotFoundError:
-                pass
-        run(["fc-cache", "-f"], capture=True, check=False, as_target_user=True)
-        out(f"Removed: {removed}")
-        out(f"Blocked: {blocked}")
-        if font_records_left:
-            out(f"Manifest kept: {manifest}")
-            return EXIT_PARTIAL
-        out(f"Deleted: {manifest}")
+            out(f"would remove: {path}")
+            remaining.append(record)
+            continue
+        try:
+            path.unlink()
+            fsync_directory(path.parent)
+            removed += 1
+        except OSError as exc:
+            record["_uninstall_status"] = f"remove-failed:{exc.errno}"
+            remaining.append(record)
+            blocked += 1
+    if args.dry_run:
+        out(f"Would remove: {removable}")
         return EXIT_OK
+    font_records_left = [r for r in remaining if r.get("record") == "font_file"]
+    if font_records_left:
+        write_manifest_atomic(manifest, clean_runtime_fields(remaining))
+    else:
+        try:
+            manifest.unlink()
+            fsync_directory(manifest.parent)
+        except FileNotFoundError:
+            pass
+    run(["fc-cache", "-f"], capture=True, check=False, as_target_user=True)
+    out(f"Removed: {removed}")
+    out(f"Blocked: {blocked}")
+    if font_records_left:
+        out(f"Manifest kept: {manifest}")
+        return EXIT_PARTIAL
+    out(f"Deleted: {manifest}")
+    return EXIT_OK
 
 
 def scan_command(args: argparse.Namespace) -> int:
@@ -1922,7 +2619,8 @@ def images_command(args: argparse.Namespace) -> int:
         info = detect_source(source, tmp, tm)
         if not (info.source_type.endswith("windows-image") or info.source_type.endswith("windows-media")):
             raise WinfontsError("source is not Windows WIM/ESD media; Office and loose-font sources do not have image indexes", EXIT_USAGE)
-        assert info.wim is not None
+        if info.wim is None:
+            raise WinfontsError("internal error: Windows image source has no WIM/ESD path", EXIT_IO)
         proc = run(["wimlib-imagex", "info", str(info.wim)], capture=True)
         out(proc.stdout.rstrip())
         return EXIT_OK
@@ -1968,11 +2666,19 @@ def positive_int(value: str) -> int:
     return int(value)
 
 
-def sha256_value(value: str) -> str:
-    normalized = value.strip().casefold()
-    if not re.fullmatch(r"[0-9a-f]{64}", normalized):
-        raise argparse.ArgumentTypeError("must be exactly 64 hexadecimal characters")
-    return normalized
+def source_sha256_spec(value: str) -> str:
+    normalized = value.strip()
+    digest = normalized.rsplit("=", 1)[-1].casefold()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise argparse.ArgumentTypeError(
+            "must be HASH or SOURCE=HASH with exactly 64 hexadecimal hash characters"
+        )
+    if "=" in normalized:
+        source, _digest = normalized.rsplit("=", 1)
+        if not source:
+            raise argparse.ArgumentTypeError("SOURCE cannot be empty")
+        return f"{source}={digest}"
+    return digest
 
 
 COMMAND_NAMES = (
@@ -1991,6 +2697,8 @@ COMMAND_NAMES = (
     "uninstall",
     "rollback",
     "remove",
+    "repair",
+    "fix-manifest",
     "doctor",
     "check",
     "paths",
@@ -2221,6 +2929,7 @@ def interactive_command(_args: argparse.Namespace) -> int:
         out("  6) Show paths")
         out("  7) Check dependencies")
         out("  8) List Windows editions")
+        out("  9) Preview manifest repair")
         out("  h) Help")
         out("  q) Quit")
         choice = prompt_text("Choose an action")
@@ -2276,6 +2985,8 @@ def interactive_command(_args: argparse.Namespace) -> int:
                 run_interactive_action(parser, ["images", source])
             else:
                 out("Cancelled.")
+        elif normalized == "9":
+            run_interactive_action(parser, ["repair", "--dry-run"])
         elif normalized in {"h", "help", "?"}:
             parser.print_help()
         else:
@@ -2335,6 +3046,9 @@ Common commands:
 
   ./winfonts status
       Show whether installed files still match the manifest.
+
+  ./winfonts repair --dry-run
+      Preview repairs for missing, modified, unsafe, or interrupted records.
 
   ./winfonts list
       List font files recorded in the manifest.
@@ -2507,6 +3221,75 @@ Examples:
     )
     uninstall.set_defaults(func=uninstall_command)
 
+    repair = sub.add_parser(
+        "repair",
+        aliases=("fix-manifest",),
+        formatter_class=HelpFormatter,
+        help="repair inconsistent manifest records",
+        description=(
+            "Forget selected invalid records and compact duplicate or empty "
+            "transaction records. Font files are never modified."
+        ),
+        epilog="""\
+Examples:
+  ./winfonts repair --dry-run
+  ./winfonts repair --drop-missing --compact
+  ./winfonts repair --drop-modified --drop-symlink --compact
+  ./winfonts repair --recover-pending
+""",
+    )
+    repair.add_argument(
+        "--manifest",
+        metavar="PATH",
+        help="manifest to repair",
+    )
+    repair.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="preview all applicable repairs without changing the manifest",
+    )
+    repair.add_argument(
+        "--drop-missing",
+        action="store_true",
+        help="forget records whose managed files are missing",
+    )
+    repair.add_argument(
+        "--drop-modified",
+        "--forget-modified",
+        dest="drop_modified",
+        action="store_true",
+        help="forget records whose managed files have changed; files remain untouched",
+    )
+    repair.add_argument(
+        "--drop-symlink",
+        "--forget-symlink",
+        dest="drop_symlink",
+        action="store_true",
+        help="forget records replaced by symlinks; symlinks remain untouched",
+    )
+    repair.add_argument(
+        "--drop-malformed",
+        action="store_true",
+        help="forget malformed or unreadable font records",
+    )
+    repair.add_argument(
+        "--compact",
+        "--compact-manifest",
+        "--prune-empty-transactions",
+        dest="compact",
+        action="store_true",
+        help="deduplicate destination records and prune unreferenced transactions",
+    )
+    repair.add_argument(
+        "--recover-pending",
+        action="store_true",
+        help=(
+            "remove hash-matching files left by an interrupted install; "
+            "committed files are preserved"
+        ),
+    )
+    repair.set_defaults(func=repair_command)
+
     doctor = sub.add_parser(
         "doctor",
         aliases=("check",),
@@ -2617,11 +3400,12 @@ def add_source_decision_args(parser: argparse.ArgumentParser, *, include_dry_run
     )
     parser.add_argument(
         "--source-sha256",
-        metavar="HASH",
-        type=sha256_value,
+        metavar="[SOURCE=]HASH",
+        type=source_sha256_spec,
+        action="append",
         help=(
-            "verify one regular-file source against this SHA-256 before extraction "
-            "and record the verified hash in the manifest"
+            "verify a regular-file source before extraction; use HASH for one source "
+            "or repeat SOURCE=HASH for multiple sources"
         ),
     )
     if include_dry_run:
@@ -2660,9 +3444,12 @@ def add_source_decision_args(parser: argparse.ArgumentParser, *, include_dry_run
     )
     parser.add_argument(
         "--duplicate-policy",
-        choices=("skip-existing", "prefer-newer", "prefer-source", "keep-all"),
+        choices=("skip-existing", "prefer-newer", "install-source", "prefer-source", "keep-all"),
         default="skip-existing",
-        help="how to handle fonts that match already installed metadata/content; default is skip-existing",
+        help=(
+            "how to handle fonts matching installed metadata/content; "
+            "prefer-source is a deprecated alias for install-source"
+        ),
     )
     parser.add_argument("--force", action="store_true", help=argparse.SUPPRESS)
 

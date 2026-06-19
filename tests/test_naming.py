@@ -118,6 +118,78 @@ class FontNamingTests(unittest.TestCase):
         self.assertEqual(candidate.state, "skip")
         self.assertEqual(candidate.reason, "older-version")
 
+    def test_keep_all_keeps_identical_content_in_the_same_run(self) -> None:
+        first = make_candidate("first.ttf")
+        second = make_candidate("second.ttf")
+        with tempfile.TemporaryDirectory() as raw_dest:
+            dest = Path(raw_dest)
+            with patch(
+                "winfonts_engine.installed_font_index",
+                return_value=({}, {}),
+            ):
+                winfonts.decide_candidates([first, second], dest, "keep-all")
+
+        self.assertEqual(first.state, "install")
+        self.assertEqual(second.state, "install")
+
+    def test_metadata_builder_only_deduplicates_when_requested(self) -> None:
+        face = make_face()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            first_path = root / "first.ttf"
+            second_path = root / "second.ttf"
+            first_path.write_bytes(b"same")
+            second_path.write_bytes(b"same")
+            first = make_candidate(str(first_path), digest="")
+            second = make_candidate(str(second_path), digest="")
+            with patch("winfonts_engine.fc_scan", return_value=[face]):
+                winfonts.build_candidate_metadata(
+                    [first, second],
+                    keep_duplicate_content=True,
+                )
+
+        self.assertEqual(first.state, "pending")
+        self.assertEqual(second.state, "pending")
+        self.assertEqual(first.sha256, second.sha256)
+
+    def test_directory_candidates_ignore_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            outside = root / "outside.ttf"
+            outside.write_bytes(b"font")
+            source = root / "source"
+            source.mkdir()
+            (source / "linked.ttf").symlink_to(outside)
+
+            candidates = winfonts.candidates_from_directory(
+                source,
+                "loose-font-directory",
+                str(source),
+                "",
+                None,
+            )
+
+        self.assertEqual(candidates, [])
+
+    def test_install_candidate_refuses_a_target_created_after_planning(self) -> None:
+        face = make_face()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source.ttf"
+            source.write_bytes(b"font")
+            target = root / "target.ttf"
+            target.write_bytes(b"do not overwrite")
+            candidate = make_candidate(str(source), digest=winfonts.sha256_file(source))
+            candidate.size = source.stat().st_size
+            candidate.faces = [face]
+            candidate.target = target
+
+            with patch("winfonts_engine.fc_scan", return_value=[face]):
+                with self.assertRaises(winfonts.WinfontsError):
+                    winfonts.install_candidate(candidate, root)
+
+            self.assertEqual(target.read_bytes(), b"do not overwrite")
+
 
 if __name__ == "__main__":
     unittest.main()
