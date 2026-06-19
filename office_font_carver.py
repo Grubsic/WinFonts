@@ -272,7 +272,7 @@ def decode_name(platform: int, raw: bytes) -> str | None:
 
 
 def font_name(blob: bytes, extension: str) -> str | None:
-    if extension == ".ttc":
+    if extension in (".ttc", ".otc"):
         if len(blob) < 16:
             return None
         directory_offset = be32(blob, 12)
@@ -344,11 +344,13 @@ class Carver:
         output: Path,
         dry_run: bool,
         max_font_size: int,
+        source_path: str,
         records: TextIO | None = None,
     ) -> None:
         self.output = output
         self.dry_run = dry_run
         self.max_font_size = max_font_size
+        self.source_path = source_path
         self.records = records
         self.buffer = bytearray()
         self.base = 0
@@ -460,6 +462,7 @@ class Carver:
                     {
                         "record": "candidate",
                         "source_type": "office-clicktorun",
+                        "source_path": self.source_path,
                         "source_stream": self.current_stream,
                         "output_path": str(target),
                         "filename": target.name,
@@ -690,7 +693,7 @@ def find_streams(
 def copy_loose_fonts(root: Path, output: Path, dry_run: bool, carver: Carver) -> int:
     count = 0
     for path in root.rglob("*"):
-        if not path.is_file() or path.suffix.lower() not in (".ttf", ".otf", ".ttc"):
+        if not path.is_file() or path.suffix.lower() not in (".ttf", ".otf", ".ttc", ".otc"):
             continue
         try:
             blob = path.read_bytes()
@@ -784,6 +787,7 @@ def main(argv: list[str] | None = None) -> int:
         output=output,
         dry_run=args.dry_run,
         max_font_size=args.max_font_size,
+        source_path=str(source),
         records=records_handle,
     )
     languages = {value.lower() for value in args.language}

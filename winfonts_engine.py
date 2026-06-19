@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 APP = "winfonts"
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 SCHEMA = 2
 HASH_ALGO = "sha256"
 FONT_EXTS = {".ttf", ".otf", ".ttc", ".otc"}
@@ -77,6 +77,13 @@ def out(message: str) -> None:
 
 def command_exists(name: str) -> bool:
     return shutil.which(name) is not None
+
+
+def archive_extractor() -> str | None:
+    for name in ("7zz", "7z", "7za"):
+        if command_exists(name):
+            return name
+    return None
 
 
 def target_user_context() -> UserContext:
@@ -249,7 +256,7 @@ def default_manifest() -> Path:
 
 
 def source_default_subdir(info: SourceInfo) -> str:
-    if info.source_type.endswith("office-clicktorun"):
+    if info.source_type.endswith(("office-clicktorun", "office-legacy-media")):
         return "office"
     if (
         info.source_type.endswith("windows-image")
@@ -499,6 +506,8 @@ class Candidate:
     source_type: str
     source_path: str
     source_stream: str = ""
+    source_media_path: str = ""
+    source_media_sha256: str = ""
     wim_image_index: int | None = None
     size: int = 0
     sha256: str = ""
@@ -514,6 +523,7 @@ class SourcePlan:
     source: Path
     info: SourceInfo
     dest: Path
+    source_sha256: str = ""
 
 
 def norm(value: str) -> str:
@@ -605,6 +615,37 @@ class TempManager:
         self.mounts.append(mount_dir)
         return mount_dir
 
+    def extract_image(self, source: Path, tmp: Path) -> Path:
+        extractor = archive_extractor()
+        if extractor is None:
+            raise WinfontsError(
+                "opening this disk image without a loop mount requires 7z, 7zz, or 7za",
+                EXIT_USAGE,
+            )
+        extract_dir = tmp / f"archive-{uuid.uuid4().hex}"
+        extract_dir.mkdir()
+        log(f"mount unavailable; extracting disk image with {extractor}: {source}")
+        proc = subprocess.run(
+            [
+                extractor,
+                "x",
+                "-y",
+                "-bso0",
+                "-bsp0",
+                "-bse1",
+                f"-o{extract_dir}",
+                str(source),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            details = (proc.stderr or proc.stdout or "").strip()
+            suffix = f": {details}" if details else f" (exit code {proc.returncode})"
+            raise WinfontsError(f"could not extract disk image {source}{suffix}", EXIT_IO)
+        return extract_dir
+
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         for mount_dir in reversed(self.mounts):
             try:
@@ -624,11 +665,27 @@ def detect_source(source: Path, tmp: Path, tm: TempManager) -> SourceInfo:
         if has_wim_signature(source):
             return SourceInfo("windows-image", root=source.parent, wim=source)
         if should_try_mount_image(source):
-            mounted = tm.mount_image(source, tmp)
-            info = detect_source(mounted, tmp, tm)
-            info.source_type = mounted_source_prefix(source) + ":" + info.source_type
-            info.mounted = mounted
-            return info
+            try:
+                mounted = tm.mount_image(source, tmp)
+            except WinfontsError as mount_error:
+                if archive_extractor() is None:
+                    raise
+                extracted = tm.extract_image(source, tmp)
+                try:
+                    info = detect_source(extracted, tmp, tm)
+                except WinfontsError as extract_error:
+                    raise WinfontsError(
+                        f"{mount_error}\n7-Zip fallback also failed to identify supported media: {extract_error}",
+                        extract_error.code,
+                    ) from extract_error
+                info.source_type = mounted_source_prefix(source) + "-archive:" + info.source_type
+                info.notes.append("disk image opened with 7-Zip because a read-only loop mount was unavailable")
+                return info
+            else:
+                info = detect_source(mounted, tmp, tm)
+                info.source_type = mounted_source_prefix(source) + ":" + info.source_type
+                info.mounted = mounted
+                return info
         raise WinfontsError(
             f"unknown regular file type, not WIM/ESD or a mountable ISO/IMG-style disk image: {source}",
             EXIT_USAGE,
@@ -651,6 +708,8 @@ def detect_source(source: Path, tmp: Path, tm: TempManager) -> SourceInfo:
 
     if is_office_clicktorun(source):
         types.append(SourceInfo("office-clicktorun", root=source))
+    elif not types and has_legacy_office_payloads(source):
+        types.append(SourceInfo("office-legacy-media", root=source))
     elif not types and has_loose_fonts(source):
         types.append(SourceInfo("loose-font-directory", root=source))
 
@@ -658,7 +717,11 @@ def detect_source(source: Path, tmp: Path, tm: TempManager) -> SourceInfo:
         names = ", ".join(item.source_type for item in types)
         raise WinfontsError(f"ambiguous source contains multiple supported layouts: {names}", EXIT_USAGE)
     if not types:
-        raise WinfontsError("source does not contain Windows fonts, Windows WIM/ESD media, Office Click-to-Run streams, or loose fonts", EXIT_NOT_FOUND)
+        raise WinfontsError(
+            "source does not contain Windows fonts, Windows WIM/ESD media, "
+            "Office Click-to-Run streams, legacy Office CAB/MSI payloads, or loose fonts",
+            EXIT_NOT_FOUND,
+        )
     return types[0]
 
 
@@ -680,6 +743,30 @@ def is_office_clicktorun(root: Path) -> bool:
             name = path.name.casefold()
             if name.startswith("stream.") and name.endswith(".dat"):
                 return True
+    return False
+
+
+def has_legacy_office_payloads(root: Path) -> bool:
+    has_setup = any(path.is_file() and path.name.casefold() == "setup.exe" for path in root.glob("*"))
+    office_tokens = (
+        "office",
+        "proplus",
+        "proof",
+        "word",
+        "excel",
+        "outlook",
+        "powerpoint",
+        "visio",
+        "project",
+        "access",
+        "publisher",
+    )
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix.casefold() not in {".cab", ".msi"}:
+            continue
+        lowered = str(path.relative_to(root)).casefold()
+        if has_setup or any(token in lowered for token in office_tokens):
+            return True
     return False
 
 
@@ -863,10 +950,22 @@ def extract_candidates(
 
     if info.source_type.endswith("windows-fonts-dir"):
         assert info.windows_fonts is not None
-        return candidates_from_directory(info.windows_fonts, "windows-fonts-dir", str(info.windows_fonts), "", None), notes
+        return candidates_from_directory(
+            info.windows_fonts,
+            info.source_type,
+            str(info.windows_fonts),
+            "",
+            None,
+        ), notes
 
     if info.source_type.endswith("loose-font-directory"):
-        return candidates_from_directory(info.root, "loose-font-directory", str(info.root), "", None), notes
+        return candidates_from_directory(
+            info.root,
+            info.source_type,
+            str(info.root),
+            "",
+            None,
+        ), notes
 
     if info.source_type.endswith("office-clicktorun"):
         check_space(tmp, 512 * 1024 * 1024, "Office temporary extraction")
@@ -896,7 +995,105 @@ def extract_candidates(
             raise WinfontsError(f"Office extraction failed with exit code {proc.returncode}", proc.returncode)
         return candidates_from_office_records(records), notes
 
+    if info.source_type.endswith("office-legacy-media"):
+        return extract_legacy_office_candidates(info, cand_dir), notes
+
     raise WinfontsError(f"internal error: unsupported source type: {info.source_type}")
+
+
+def extract_legacy_office_candidates(info: SourceInfo, output: Path) -> list[Candidate]:
+    loose_candidates = candidates_from_directory(
+        info.root,
+        "office-legacy-media",
+        str(info.root),
+        "",
+        None,
+    )
+    cab_files = sorted(
+        (path for path in info.root.rglob("*") if path.is_file() and path.suffix.casefold() == ".cab"),
+        key=lambda item: str(item).casefold(),
+    )
+    msi_files = sorted(
+        (path for path in info.root.rglob("*") if path.is_file() and path.suffix.casefold() == ".msi"),
+        key=lambda item: str(item).casefold(),
+    )
+    available: list[str] = []
+    if cab_files and command_exists("cabextract"):
+        available.append("cabextract")
+    if msi_files and command_exists("msiextract"):
+        available.append("msiextract")
+    if not available:
+        if loose_candidates:
+            log(
+                "legacy Office extraction: "
+                f"using {len(loose_candidates)} loose font candidate(s); CAB/MSI tools unavailable"
+            )
+            return loose_candidates
+        needed: list[str] = []
+        if cab_files:
+            needed.append("cabextract")
+        if msi_files:
+            needed.append("msiextract")
+        raise WinfontsError(
+            "legacy Office media requires "
+            + " and/or ".join(needed or ["cabextract", "msiextract"])
+            + " to unpack CAB/MSI payloads",
+            EXIT_USAGE,
+        )
+
+    failures = 0
+    extracted_archives = 0
+    for index, path in enumerate(cab_files, start=1):
+        if not command_exists("cabextract"):
+            continue
+        archive_out = output / f"cab-{index}"
+        archive_out.mkdir()
+        proc = subprocess.run(
+            ["cabextract", "-q", "-d", str(archive_out), str(path)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            extracted_archives += 1
+        else:
+            failures += 1
+
+    for index, path in enumerate(msi_files, start=1):
+        if not command_exists("msiextract"):
+            continue
+        archive_out = output / f"msi-{index}"
+        archive_out.mkdir()
+        proc = subprocess.run(
+            ["msiextract", "-C", str(archive_out), str(path)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            extracted_archives += 1
+        else:
+            failures += 1
+
+    archive_candidates = candidates_from_directory(
+        output,
+        "office-legacy-media",
+        str(info.root),
+        "",
+        None,
+    )
+    candidates = loose_candidates + archive_candidates
+    log(
+        "legacy Office extraction: "
+        f"archives={extracted_archives}, failures={failures}, "
+        f"loose={len(loose_candidates)}, extracted={len(archive_candidates)}"
+    )
+    if not candidates:
+        raise WinfontsError(
+            "legacy Office CAB/MSI extraction produced no font candidates",
+            EXIT_NO_FONTS,
+        )
+    return candidates
 
 
 def candidates_from_directory(root: Path, source_type: str, source_path: str, stream: str, image: int | None) -> list[Candidate]:
@@ -1006,6 +1203,8 @@ def choose_target(
     dest: Path,
     cand: Candidate,
     reserved: dict[Path, str] | None = None,
+    *,
+    reuse_identical: bool = True,
 ) -> tuple[Path, str]:
     reserved = reserved if reserved is not None else {}
     filename = preferred_installed_filename(cand)
@@ -1013,7 +1212,7 @@ def choose_target(
     state = target_content_state(target, cand.sha256, reserved)
     if state == "free":
         return target, "new-file"
-    if state == "identical":
+    if state == "identical" and reuse_identical:
         return target, "identical-file"
 
     reason = "filename-collision-symlink" if state == "symlink" else "filename-collision"
@@ -1026,7 +1225,7 @@ def choose_target(
         candidate_state = target_content_state(candidate_target, cand.sha256, reserved)
         if candidate_state == "free":
             return candidate_target, reason
-        if candidate_state == "identical":
+        if candidate_state == "identical" and reuse_identical:
             return candidate_target, "identical-file"
     raise WinfontsError(f"could not choose collision-free filename for {cand.original_filename}", EXIT_IO)
 
@@ -1065,7 +1264,12 @@ def decide_candidates(
             counters[cand.reason] = counters.get(cand.reason, 0) + 1
             continue
 
-        target, target_state = choose_target(candidate_dest(cand, dest), cand, reserved_targets)
+        target, target_state = choose_target(
+            candidate_dest(cand, dest),
+            cand,
+            reserved_targets,
+            reuse_identical=duplicate_policy != "keep-all",
+        )
         cand.target = target
         if target_state == "identical-file" and duplicate_policy != "keep-all":
             cand.state = "skip"
@@ -1093,21 +1297,33 @@ def decide_candidates(
                     elif face.revision < max(existing_revisions):
                         older_hits += 1
 
-        if exact_hits == len(cand.faces) and duplicate_policy == "skip-existing":
-            cand.state = "skip"
-            cand.reason = "identical-font-metadata"
-        elif older_hits and not newer_hits and duplicate_policy == "skip-existing":
-            cand.state = "skip"
-            cand.reason = "older-version"
-        elif exact_hits and exact_hits < len(cand.faces):
-            cand.state = "install"
-            cand.reason = "partially-duplicated-collection"
-        elif newer_hits:
-            cand.state = "install"
-            cand.reason = "newer-version"
-        elif partial_hits and duplicate_policy == "skip-existing":
-            cand.state = "install"
-            cand.reason = "different-version-or-face"
+        if duplicate_policy in {"skip-existing", "prefer-newer"}:
+            if exact_hits == len(cand.faces):
+                cand.state = "skip"
+                cand.reason = "identical-font-metadata"
+            elif older_hits and not newer_hits:
+                cand.state = "skip"
+                cand.reason = "older-version"
+            elif (
+                duplicate_policy == "prefer-newer"
+                and partial_hits
+                and not newer_hits
+                and exact_hits + partial_hits == len(cand.faces)
+            ):
+                cand.state = "skip"
+                cand.reason = "not-newer-version"
+            elif exact_hits and exact_hits < len(cand.faces):
+                cand.state = "install"
+                cand.reason = "partially-duplicated-collection"
+            elif newer_hits:
+                cand.state = "install"
+                cand.reason = "newer-version"
+            elif partial_hits:
+                cand.state = "install"
+                cand.reason = "different-version-or-face"
+            else:
+                cand.state = "install"
+                cand.reason = target_state
         else:
             cand.state = "install"
             cand.reason = target_state
@@ -1207,6 +1423,8 @@ def install_candidate(cand: Candidate, dest: Path) -> dict[str, Any]:
             "source_path": cand.source_path,
             "source_type": cand.source_type,
             "source_stream": cand.source_stream,
+            "source_media_path": cand.source_media_path,
+            "source_media_sha256": cand.source_media_sha256,
             "wim_image_index": cand.wim_image_index,
             "faces": [face.to_json() for face in cand.faces],
             "newly_created": True,
@@ -1242,6 +1460,22 @@ def install_command(args: argparse.Namespace) -> int:
         reject_bad_path_text(args.manifest, "--manifest")
     if args.image is not None and args.image <= 0:
         raise WinfontsError("--image must be a positive integer", EXIT_USAGE)
+    source_hashes: dict[Path, str] = {}
+    source_sha256 = getattr(args, "source_sha256", None)
+    if source_sha256 is not None:
+        if len(sources) != 1:
+            raise WinfontsError("--source-sha256 requires exactly one source", EXIT_USAGE)
+        if not sources[0].is_file():
+            raise WinfontsError("--source-sha256 can only verify a regular source file", EXIT_USAGE)
+        log(f"verifying source SHA-256: {sources[0]}")
+        actual = sha256_file(sources[0])
+        if actual != source_sha256:
+            raise WinfontsError(
+                f"source SHA-256 mismatch: expected {source_sha256}, got {actual}",
+                EXIT_VERIFY,
+            )
+        source_hashes[sources[0]] = actual
+        log(f"source SHA-256 verified: {actual}")
 
     tm = TempManager()
     with tm as tmp:
@@ -1261,7 +1495,14 @@ def install_command(args: argparse.Namespace) -> int:
                 dest = canonical_future_path(dest_arg, "dest")
             else:
                 dest = canonical_for_create(dest_arg, "dest", create_parent=True)
-            plans.append(SourcePlan(source=source, info=info, dest=dest))
+            plans.append(
+                SourcePlan(
+                    source=source,
+                    info=info,
+                    dest=dest,
+                    source_sha256=source_hashes.get(source, ""),
+                )
+            )
 
         manifest_arg = Path(args.manifest) if args.manifest is not None else default_manifest()
         if args.dry_run:
@@ -1317,6 +1558,9 @@ def _install_with_temp(
             )
             for candidate in source_candidates:
                 candidate.install_dir = plan.dest
+                candidate.source_type = plan.info.source_type
+                candidate.source_media_path = str(plan.source)
+                candidate.source_media_sha256 = plan.source_sha256
             log(f"source candidates: {len(source_candidates)}")
             candidates.extend(source_candidates)
 
@@ -1362,6 +1606,14 @@ def _install_with_temp(
                 "destinations": [str(dest) for dest in destinations],
                 "source": str(plans[0].source) if len(plans) == 1 else "multiple",
                 "sources": [str(plan.source) for plan in plans],
+                "source_sha256": [
+                    {
+                        "path": str(plan.source),
+                        "sha256": plan.source_sha256,
+                    }
+                    for plan in plans
+                    if plan.source_sha256
+                ],
             }
         ]
         for candidate in installable:
@@ -1561,7 +1813,7 @@ def list_command(args: argparse.Namespace) -> int:
                 "name": record_display_name(record),
                 "status": str(record.get("_status", "unknown")),
                 "path": str(record.get("dest_path", "")),
-                "source": str(record.get("source_path", "")),
+                "source": str(record.get("source_media_path") or record.get("source_path", "")),
                 "installed_at": str(record.get("installed_at", "")),
             }
         )
@@ -1682,6 +1934,8 @@ def doctor_command(_args: argparse.Namespace) -> int:
         "mount": "needed only when opening ISO/IMG files directly",
         "umount": "needed only when opening ISO/IMG files directly",
         "wimlib-imagex": "needed only for Windows ISO/WIM/ESD sources",
+        "cabextract": "needed only for legacy Office CAB media",
+        "msiextract": "needed only for legacy Office MSI media",
     }
     ok = True
     out("Core requirements:")
@@ -1696,6 +1950,11 @@ def doctor_command(_args: argparse.Namespace) -> int:
     for cmd, note in optional.items():
         exists = command_exists(cmd)
         out(f"  {'ok' if exists else 'optional-missing'}      {cmd} ({note})")
+    extractor = archive_extractor()
+    out(
+        f"  {'ok' if extractor else 'optional-missing'}      "
+        f"{extractor or '7z/7zz/7za'} (non-root fallback for ISO/IMG extraction)"
+    )
     if ok:
         out("Result: ready. Missing optional tools only limit specific source types.")
     else:
@@ -1707,6 +1966,13 @@ def positive_int(value: str) -> int:
     if not value or not value.isdigit() or int(value) <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return int(value)
+
+
+def sha256_value(value: str) -> str:
+    normalized = value.strip().casefold()
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+        raise argparse.ArgumentTypeError("must be exactly 64 hexadecimal characters")
+    return normalized
 
 
 COMMAND_NAMES = (
@@ -2323,7 +2589,8 @@ def add_source_decision_args(parser: argparse.ArgumentParser, *, include_dry_run
         nargs="+",
         help=(
             "one or more Windows ISO/IMG files, mounted Windows media, install.wim/esd files, "
-            "Windows/Fonts directories, Office IMG/mounts, or loose font directories"
+            "Windows/Fonts directories, Office IMG/mounts or CAB/MSI media, "
+            "or loose font directories"
         ),
     )
     parser.add_argument(
@@ -2347,6 +2614,15 @@ def add_source_decision_args(parser: argparse.ArgumentParser, *, include_dry_run
         "--manifest",
         metavar="PATH",
         help="override manifest path",
+    )
+    parser.add_argument(
+        "--source-sha256",
+        metavar="HASH",
+        type=sha256_value,
+        help=(
+            "verify one regular-file source against this SHA-256 before extraction "
+            "and record the verified hash in the manifest"
+        ),
     )
     if include_dry_run:
         parser.add_argument(

@@ -36,6 +36,7 @@ For command-line use:
 ./winfonts doctor
 ./winfonts scan /path/to/Office.img --office-x-none-only
 ./winfonts install /path/to/Office.img --office-x-none-only
+./winfonts install /path/to/Windows.iso --source-sha256 EXPECTED_SHA256
 ./winfonts list
 ./winfonts status
 ./winfonts uninstall --dry-run
@@ -105,6 +106,7 @@ One command may receive one or more sources:
 - `install.wim`, `install.esd`, or a directory containing either;
 - an installed Windows partition containing `Windows/Fonts`;
 - Office Click-to-Run IMG files or mounted media;
+- legacy Office media containing CAB or MSI payloads;
 - directories containing loose `.ttf`, `.otf`, `.ttc`, or `.otc` files.
 
 All candidates from all sources are deduplicated together:
@@ -143,7 +145,8 @@ would otherwise use the same filename.
 
 ## Office media
 
-The recommended first pass scans language-neutral Office resources:
+For modern Click-to-Run media, the recommended first pass scans
+language-neutral Office resources:
 
 ```sh
 ./winfonts scan Office.img --office-x-none-only
@@ -161,6 +164,18 @@ Useful Office options:
 - `--office-x-none-only` usually finds shared Office fonts much faster.
 - `--office-arch` accepts `x64`, `x86`, or `all`; its default is `x64`.
 - `--office-language TAG` may be repeated to include language-specific streams.
+
+Legacy Office media is handled separately. If a source contains recognizable
+Office CAB or MSI payloads, `winfonts` uses `cabextract` and/or `msiextract`
+without executing Windows installers:
+
+```sh
+./winfonts scan /path/to/legacy-office-media
+./winfonts install /path/to/legacy-office-media
+```
+
+Loose font files found in modern Office media are copied before opaque
+Click-to-Run streams are carved.
 
 ## Windows media
 
@@ -181,6 +196,16 @@ To select another edition:
 
 `wimlib-imagex` is required for Windows ISO, WIM, and ESD sources but is not
 required for Office or loose-font directories.
+
+To verify official media before extraction and retain the verified digest in
+the manifest:
+
+```sh
+EXPECTED_SHA256="replace-with-the-64-hex-digit-published-checksum"
+./winfonts install Windows.iso --source-sha256 "$EXPECTED_SHA256"
+```
+
+This option accepts one regular-file source at a time.
 
 ## Inspecting managed fonts
 
@@ -288,6 +313,13 @@ Duplicate policy options:
 
 The default is `skip-existing`.
 
+- `skip-existing` skips identical metadata and older versions.
+- `prefer-newer` installs only new faces or newer revisions.
+- `prefer-source` installs the supplied source unless its exact file content is
+  already at the target.
+- `keep-all` always chooses a new filename and never overwrites a pre-existing
+  file.
+
 ## Dependencies
 
 Check the current machine:
@@ -305,7 +337,10 @@ Core requirements:
 Source-specific tools:
 
 - `mount` and `umount` when opening ISO/IMG files directly;
+- `7z`, `7zz`, or `7za` as a non-root extraction fallback when loop mounting is
+  unavailable;
 - `wimlib-imagex` for Windows ISO/WIM/ESD sources.
+- `cabextract` and `msiextract` for legacy Office media.
 
 Missing source-specific tools are reported as optional because Office media,
 mounted directories, and loose-font folders may still work.
@@ -318,6 +353,10 @@ Some distributions restrict loop mounting to root:
 sudo ./winfonts scan Office.img --office-x-none-only
 sudo ./winfonts install Windows.iso
 ```
+
+If 7-Zip is installed, `winfonts` automatically falls back to extracting an
+ISO/IMG into a temporary directory when a read-only loop mount is unavailable.
+This avoids `sudo` at the cost of additional temporary disk space.
 
 When run through `sudo`, `winfonts` targets the original `SUDO_USER` home rather
 than `/root`.
@@ -346,11 +385,29 @@ chmod +x winfonts
 - Fonts are validated with Fontconfig before and after copying.
 - Copies use a temporary file followed by an atomic rename.
 - Content hashes prevent accidental duplicate installation.
+- `keep-all` never reuses or overwrites an existing pathname.
 - Planned filenames are reserved to prevent same-run overwrites.
 - Every installed file is recorded in a JSON Lines manifest.
+- `--source-sha256` verifies media before extraction and records its provenance.
 - Uninstall verifies hashes before deleting anything.
 - A lock prevents install, uninstall, and status operations from racing.
 - Failed transactions roll back files already copied by that transaction.
+
+## Licensing and redistribution
+
+Use media obtained from Microsoft or your own legitimately licensed
+installation. Keep extracted proprietary fonts local to the licensed machine.
+Do not commit them to Git, publish them in packages or containers, place them
+on shared servers, or convert them to another font format as a redistribution
+workaround. Font embedding in documents is a separate right controlled by each
+font's OpenType embedding flags.
+
+[Microsoft's font redistribution FAQ](https://learn.microsoft.com/en-us/typography/fonts/font-faq)
+specifically states that Segoe UI Variable is not licensed for use outside
+Microsoft products or on non-Windows platforms. For document compatibility
+without proprietary binaries, consider metric-compatible
+[Liberation fonts](https://github.com/liberationfonts/liberation-fonts).
+This project is an extraction tool, not legal advice.
 
 ## Exit codes
 

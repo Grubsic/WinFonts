@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import winfonts_engine as winfonts
 
@@ -85,6 +86,37 @@ class FontNamingTests(unittest.TestCase):
             target, reason = winfonts.choose_target(dest, candidate, reserved)
             self.assertEqual(target.name, "Aptos-Bold-aaaaaaaaaaaa.ttf")
             self.assertEqual(reason, "filename-collision")
+
+    def test_keep_all_never_reuses_an_identical_existing_file(self) -> None:
+        candidate = make_candidate("ba67safs67d6asd6732h23f7uhn2809vgh29.ttf")
+        with tempfile.TemporaryDirectory() as raw_dest:
+            dest = Path(raw_dest)
+            original = dest / "Aptos-Bold.ttf"
+            original.write_bytes(b"same font")
+            candidate.sha256 = winfonts.sha256_file(original)
+
+            target, reason = winfonts.choose_target(dest, candidate, reuse_identical=False)
+
+            self.assertNotEqual(target, original)
+            self.assertEqual(reason, "filename-collision")
+            self.assertFalse(target.exists())
+
+    def test_prefer_newer_skips_an_older_candidate(self) -> None:
+        older = make_face()
+        older.revision = 1
+        newer = make_face()
+        newer.revision = 2
+        candidate = make_candidate("aptos-bold.ttf", faces=[older])
+        with tempfile.TemporaryDirectory() as raw_dest:
+            dest = Path(raw_dest)
+            with patch(
+                "winfonts_engine.installed_font_index",
+                return_value=({}, {older.face_key(): [newer]}),
+            ):
+                winfonts.decide_candidates([candidate], dest, "prefer-newer")
+
+        self.assertEqual(candidate.state, "skip")
+        self.assertEqual(candidate.reason, "older-version")
 
 
 if __name__ == "__main__":
